@@ -1,0 +1,182 @@
+import os
+import json
+import base64
+import aiofiles
+from pathlib import Path
+from PyPDF2 import PdfReader
+from docx import Document
+from io import BytesIO
+from app.core import get_settings
+from app.services.ai_service import AIService
+
+settings = get_settings()
+
+
+class ResumeParser:
+    def __init__(self):
+        self.ai = AIService()
+        self.upload_dir = Path(settings.upload_dir)
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
+
+    async def save_file(self, filename: str, content: bytes) -> str:
+        file_path = self.upload_dir / filename
+        async with aiofiles.open(file_path, "wb") as f:
+            await f.write(content)
+        return str(file_path)
+
+    def extract_text_from_pdf(self, content: bytes) -> str:
+        """从 PDF 提取文本"""
+        try:
+            reader = PdfReader(BytesIO(content))
+            text = ""
+            for page in reader.pages:
+                page_text = page.extract_text()
+                if page_text:
+                    text += page_text + "\n"
+
+            text = text.strip()
+            return text
+        except Exception as e:
+            print(f"PDF 提取失败: {e}")
+            return ""
+
+    def is_image_based_pdf(self, content: bytes) -> bool:
+        """检测 PDF 是否是图片版（没有可提取的文本）"""
+        try:
+            reader = PdfReader(BytesIO(content))
+            for page in reader.pages:
+                # 检查是否有字体资源
+                resources = page.get("/Resources", {})
+                if resources and "/Font" in resources:
+                    return False
+            return True
+        except:
+            return False
+
+    async def extract_text_from_image_pdf(self, content: bytes) -> str:
+        """使用 Claude Vision 从图片版 PDF 提取文本"""
+        try:
+            # 尝试导入 pdf2image
+            try:
+                from pdf2image import convert_from_bytes
+            except ImportError:
+                print("pdf2image 未安装，无法处理图片版 PDF")
+                return ""
+
+            # 将 PDF 转换为图片
+            images = convert_from_bytes(content, dpi=150, first_page=1, last_page=3)  # 只处理前3页
+
+            if not images:
+                return ""
+
+            # 将图片转为 base64
+            image_contents = []
+            for i, img in enumerate(images[:3]):  # 最多3页
+                buffer = BytesIO()
+                img.save(buffer, format="JPEG", quality=85)
+                img_base64 = base64.b64encode(buffer.getvalue()).decode()
+                image_contents.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/jpeg",
+                        "data": img_base64
+                    }
+                })
+
+            # 使用 Claude Vision 提取文本
+            image_contents.append({
+                "type": "text",
+                "text": "请仔细阅读这份简历图片，提取并返回简历中的所有文本内容。保持原有格式，包括姓名、联系方式、工作经历、教育背景、技能等信息。只返回提取的文本，不要添加任何解释。"
+            })
+
+            response = await self.ai.client.messages.create(
+                model=self.ai.model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": image_contents}]
+            )
+
+            return self.ai._extract_text(response)
+
+        except Exception as e:
+            print(f"图片 PDF 提取失败: {e}")
+            return ""
+
+    def extract_text_from_docx(self, content: bytes) -> str:
+        """从 DOCX 提取文本"""
+        try:
+            doc = Document(BytesIO(content))
+            text = ""
+            for para in doc.paragraphs:
+                text += para.text + "\n"
+
+            # 也提取表格中的文本
+            for table in doc.tables:
+                for row in table.rows:
+                    for cell in row.cells:
+                        text += cell.text + " "
+                    text += "\n"
+
+            return text.strip()
+        except Exception as e:
+            print(f"DOCX 提取失败: {e}")
+            raise ValueError(f"DOCX 文本提取失败: {str(e)}")
+
+    async def parse(self, filename: str, content: bytes) -> dict:
+        ext = filename.lower().split(".")[-1]
+        text = ""
+        extraction_method = "text"
+
+        # 提取文本
+        if ext == "pdf":
+            # 先尝试普通文本提取
+            text = self.extract_text_from_pdf(content)
+
+            # 如果提取到的文本太少，尝试图片识别
+            if len(text.strip()) < 50:
+                print(f"PDF 文本提取结果较少 ({len(text)} 字符)，尝试图片识别...")
+                if self.is_image_based_pdf(content):
+                    extraction_method = "vision"
+                    text = await self.extract_text_from_image_pdf(content)
+                    if text:
+                        print(f"图片识别成功，提取到 {len(text)} 字符")
+
+        elif ext == "docx":
+            text = self.extract_text_from_docx(content)
+        elif ext == "doc":
+            raise ValueError("不支持 .doc 格式，请将文件转换为 .docx 或 .pdf 后重试")
+        else:
+            raise ValueError(f"不支持的文件类型: {ext}")
+
+        # 检查提取结果
+        if not text or len(text.strip()) < 20:
+            raise ValueError(f"无法从文件中提取足够的文本内容 (提取到 {len(text) if text else 0} 字符)")
+
+        # 保存文件
+        file_path = await self.save_file(filename, content)
+
+        # 使用 AI 解析
+        try:
+            parsed = await self.ai.parse_resume(text)
+        except Exception as e:
+            print(f"AI 解析失败: {e}")
+            parsed = {}
+
+        return {
+            "file_path": file_path,
+            "file_name": filename,
+            "file_type": ext,
+            "raw_text": text,
+            "parsed_data": parsed,
+            "extraction_method": extraction_method
+        }
+
+    async def parse_batch(self, files: list[tuple[str, bytes]]) -> list[dict]:
+        results = []
+        for filename, content in files:
+            try:
+                result = await self.parse(filename, content)
+                results.append({"success": True, **result})
+            except Exception as e:
+                results.append({"success": False, "filename": filename, "error": str(e)})
+        return results
