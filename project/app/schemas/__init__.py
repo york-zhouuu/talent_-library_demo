@@ -1,6 +1,8 @@
 from .candidate import (
     CandidateCreate, CandidateUpdate, CandidateResponse, CandidateListResponse,
-    TagCreate, TagResponse, TalentPoolCreate, TalentPoolResponse, ResumeResponse,
+    TagCreate, TagResponse, TalentPoolCreate, TalentPoolUpdate, TalentPoolResponse, ResumeResponse,
+    # Pool sharing
+    ShareScope, SharePermission, PoolShareCreate, PoolShareResponse,
     # CKB schemas
     SkillSource, SkillEntry, LayerConflict, CandidateStatus,
     CandidateProfileResponse, CandidateKnowledgeResponse,
@@ -20,7 +22,9 @@ from .skill import (
 __all__ = [
     # Candidate schemas
     "CandidateCreate", "CandidateUpdate", "CandidateResponse", "CandidateListResponse",
-    "TagCreate", "TagResponse", "TalentPoolCreate", "TalentPoolResponse", "ResumeResponse",
+    "TagCreate", "TagResponse", "TalentPoolCreate", "TalentPoolUpdate", "TalentPoolResponse", "ResumeResponse",
+    # Pool sharing
+    "ShareScope", "SharePermission", "PoolShareCreate", "PoolShareResponse",
     # CKB schemas
     "SkillSource", "SkillEntry", "LayerConflict", "CandidateStatus",
     "CandidateProfileResponse", "CandidateKnowledgeResponse",

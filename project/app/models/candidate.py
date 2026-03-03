@@ -18,6 +18,15 @@ candidate_pools = Table(
     Column("pool_id", Integer, ForeignKey("talent_pools.id", ondelete="CASCADE"), primary_key=True),
 )
 
+# Pool sharing association table
+pool_shares = Table(
+    "pool_shares",
+    Base.metadata,
+    Column("pool_id", Integer, ForeignKey("talent_pools.id", ondelete="CASCADE"), primary_key=True),
+    Column("user_id", String(100), primary_key=True),  # Shared with user
+    Column("permission", String(20), default="view"),  # view, edit, admin
+)
+
 
 class Candidate(Base):
     __tablename__ = "candidates"
@@ -71,13 +80,29 @@ class Tag(Base):
 
 
 class TalentPool(Base):
+    """
+    人才库 - 所有库都是私有的，可通过共享机制分享给他人
+
+    share_scope:
+    - private: 仅所有者可见
+    - team: 团队成员可见 (需要 team_id)
+    - org: 全组织可见
+    - custom: 自定义共享 (通过 pool_shares 表)
+    """
     __tablename__ = "talent_pools"
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100), index=True)
     description: Mapped[str | None] = mapped_column(Text)
-    is_public: Mapped[bool] = mapped_column(default=False)
-    owner_id: Mapped[str | None] = mapped_column(String(100))  # User ID
+
+    # 所有者 (必填)
+    owner_id: Mapped[str] = mapped_column(String(100), index=True)
+
+    # 共享范围
+    share_scope: Mapped[str] = mapped_column(String(20), default="private")  # private, team, org, custom
+    team_id: Mapped[str | None] = mapped_column(String(100), index=True)  # 当 scope=team 时使用
+
+    # 时间戳
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

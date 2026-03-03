@@ -60,22 +60,60 @@ class TagResponse(TagBase):
         from_attributes = True
 
 
+class ShareScope(str, Enum):
+    """人才库共享范围"""
+    PRIVATE = "private"  # 仅所有者可见
+    TEAM = "team"  # 团队可见
+    ORG = "org"  # 全组织可见
+    CUSTOM = "custom"  # 自定义共享
+
+
+class SharePermission(str, Enum):
+    """共享权限级别"""
+    VIEW = "view"  # 只读
+    EDIT = "edit"  # 可编辑候选人
+    ADMIN = "admin"  # 可管理库设置
+
+
+class PoolShareCreate(BaseModel):
+    """添加共享"""
+    user_id: str
+    permission: SharePermission = SharePermission.VIEW
+
+
+class PoolShareResponse(BaseModel):
+    """共享信息"""
+    user_id: str
+    permission: SharePermission
+
+
 class TalentPoolBase(BaseModel):
     name: str
     description: str | None = None
-    is_public: bool = False
 
 
 class TalentPoolCreate(TalentPoolBase):
-    owner_id: str | None = None
+    owner_id: str
+    share_scope: ShareScope = ShareScope.PRIVATE
+    team_id: str | None = None  # 当 scope=team 时使用
+
+
+class TalentPoolUpdate(BaseModel):
+    name: str | None = None
+    description: str | None = None
+    share_scope: ShareScope | None = None
+    team_id: str | None = None
 
 
 class TalentPoolResponse(TalentPoolBase):
     id: int
-    owner_id: str | None
+    owner_id: str
+    share_scope: ShareScope
+    team_id: str | None = None
     created_at: datetime
     updated_at: datetime
     candidate_count: int = 0
+    shared_with: list[PoolShareResponse] = []  # 当 scope=custom 时的共享列表
 
     class Config:
         from_attributes = True

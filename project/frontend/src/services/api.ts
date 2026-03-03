@@ -5,13 +5,24 @@ const api = axios.create({
   timeout: 300000 // 5 minutes for large uploads
 })
 
+// 共享范围
+export type ShareScope = 'private' | 'team' | 'org' | 'custom'
+export type SharePermission = 'view' | 'edit' | 'admin'
+
+export interface PoolShare {
+  user_id: string
+  permission: SharePermission
+}
+
 export interface TalentPool {
   id: number
   name: string
   description: string | null
-  is_public: boolean
-  owner_id: string | null
+  owner_id: string
+  share_scope: ShareScope
+  team_id: string | null
   candidate_count: number
+  shared_with: PoolShare[]
   created_at: string
   updated_at: string
 }
@@ -41,9 +52,8 @@ export interface UploadProgress {
 }
 
 // Talent Pools
-export const getPools = async (isPublic?: boolean) => {
-  const params = isPublic !== undefined ? { is_public: isPublic } : {}
-  const res = await api.get<{ items: TalentPool[] }>('/talent-pools', { params })
+export const getPools = async () => {
+  const res = await api.get<{ items: TalentPool[] }>('/talent-pools')
   return res.data.items
 }
 
@@ -52,13 +62,43 @@ export const getPool = async (id: number) => {
   return res.data
 }
 
-export const createPool = async (data: { name: string; description?: string; is_public: boolean; owner_id?: string }) => {
+export const createPool = async (data: {
+  name: string
+  description?: string
+  owner_id: string
+  share_scope?: ShareScope
+  team_id?: string
+}) => {
   const res = await api.post<TalentPool>('/talent-pools', data)
+  return res.data
+}
+
+export const updatePool = async (id: number, data: {
+  name?: string
+  description?: string
+  share_scope?: ShareScope
+  team_id?: string
+}) => {
+  const res = await api.put<TalentPool>(`/talent-pools/${id}`, data)
   return res.data
 }
 
 export const deletePool = async (id: number) => {
   await api.delete(`/talent-pools/${id}`)
+}
+
+// Pool Sharing
+export const addPoolShare = async (poolId: number, userId: string, permission: SharePermission = 'view') => {
+  await api.post(`/talent-pools/${poolId}/shares`, { user_id: userId, permission })
+}
+
+export const removePoolShare = async (poolId: number, userId: string) => {
+  await api.delete(`/talent-pools/${poolId}/shares/${userId}`)
+}
+
+export const getPoolShares = async (poolId: number) => {
+  const res = await api.get<{ shares: PoolShare[] }>(`/talent-pools/${poolId}/shares`)
+  return res.data.shares
 }
 
 export const getPoolCandidates = async (poolId: number, page = 1, pageSize = 20) => {

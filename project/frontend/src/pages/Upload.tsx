@@ -219,7 +219,7 @@ export default function Upload() {
           <option value="">不指定人才库（仅建档）</option>
           {pools?.map(pool => (
             <option key={pool.id} value={pool.id}>
-              {pool.is_public ? '🌐' : '🔒'} {pool.name} ({pool.candidate_count} 人)
+              {pool.share_scope === 'org' ? '🏢' : pool.share_scope === 'custom' ? '👥' : '🔒'} {pool.name} ({pool.candidate_count} 人)
             </option>
           ))}
         </select>
