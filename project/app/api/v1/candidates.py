@@ -1,10 +1,10 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Header
 import re
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from app.db import get_db
-from app.models import Candidate, Tag, Resume
+from app.models import Candidate, Tag, Resume, TalentPool
 from app.schemas import (
     CandidateCreate, CandidateUpdate, CandidateResponse, CandidateListResponse
 )
@@ -18,6 +18,31 @@ from app.core import NotFoundError
 import json
 
 router = APIRouter(prefix="/candidates", tags=["candidates"])
+
+
+def get_current_user(x_user_id: str = Header(default="default_user")) -> str:
+    """从请求头获取当前用户ID"""
+    return x_user_id
+
+
+async def get_or_create_user_pool(db: AsyncSession, user_id: str) -> TalentPool:
+    """获取用户的人才库，如果不存在则自动创建"""
+    stmt = select(TalentPool).where(TalentPool.owner_id == user_id)
+    result = await db.execute(stmt)
+    pool = result.scalar_one_or_none()
+
+    if not pool:
+        pool = TalentPool(
+            name="我的人才库",
+            description="自动创建的个人人才库",
+            owner_id=user_id,
+            share_scope="private"
+        )
+        db.add(pool)
+        await db.commit()
+        await db.refresh(pool)
+
+    return pool
 
 
 def extract_name_from_filename(filename: str) -> str | None:
@@ -120,7 +145,11 @@ async def delete_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)
 
 
 @router.post("/import")
-async def import_resume(file: UploadFile = File(...), db: AsyncSession = Depends(get_db)):
+async def import_resume(
+    file: UploadFile = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
     parser = ResumeParser()
     content = await file.read()
 
@@ -167,15 +196,31 @@ async def import_resume(file: UploadFile = File(...), db: AsyncSession = Depends
         parsed_data=json.dumps(result["parsed_data"], ensure_ascii=False)
     )
     db.add(resume)
+
+    # 自动添加到用户的人才库
+    pool = await get_or_create_user_pool(db, current_user)
+    pool_stmt = select(TalentPool).options(selectinload(TalentPool.candidates)).where(TalentPool.id == pool.id)
+    pool_result = await db.execute(pool_stmt)
+    pool = pool_result.scalar_one()
+    if candidate not in pool.candidates:
+        pool.candidates.append(candidate)
+
     await db.commit()
 
-    return {"candidate_id": candidate.id, "parsed": result["parsed_data"]}
+    return {"candidate_id": candidate.id, "parsed": result["parsed_data"], "pool_id": pool.id}
 
 
 @router.post("/import/batch")
-async def import_resumes_batch(files: list[UploadFile] = File(...), db: AsyncSession = Depends(get_db)):
+async def import_resumes_batch(
+    files: list[UploadFile] = File(...),
+    db: AsyncSession = Depends(get_db),
+    current_user: str = Depends(get_current_user)
+):
     parser = ResumeParser()
     results = []
+
+    # 获取或创建用户的人才库
+    pool = await get_or_create_user_pool(db, current_user)
 
     for file in files:
         try:
@@ -220,6 +265,14 @@ async def import_resumes_batch(files: list[UploadFile] = File(...), db: AsyncSes
                 parsed_data=json.dumps(result["parsed_data"], ensure_ascii=False)
             )
             db.add(resume)
+
+            # 自动添加到用户的人才库
+            pool_stmt = select(TalentPool).options(selectinload(TalentPool.candidates)).where(TalentPool.id == pool.id)
+            pool_result = await db.execute(pool_stmt)
+            pool_with_candidates = pool_result.scalar_one()
+            if candidate not in pool_with_candidates.candidates:
+                pool_with_candidates.candidates.append(candidate)
+
             await db.commit()
 
             results.append({"success": True, "filename": file.filename, "candidate_id": candidate.id})
@@ -228,7 +281,7 @@ async def import_resumes_batch(files: list[UploadFile] = File(...), db: AsyncSes
             await db.rollback()
             results.append({"success": False, "filename": file.filename, "error": str(e)})
 
-    return {"results": results}
+    return {"results": results, "pool_id": pool.id}
 
 
 @router.post("/{candidate_id}/tags/{tag_id}")

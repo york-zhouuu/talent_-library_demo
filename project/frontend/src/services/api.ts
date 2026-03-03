@@ -358,15 +358,15 @@ export const getStats = async () => {
     api.get<{ items: TalentPool[] }>('/talent-pools')
   ])
 
-  const publicPools = pools.data.items.filter(p => p.is_public)
-  const privatePools = pools.data.items.filter(p => !p.is_public)
+  const orgPools = pools.data.items.filter(p => p.share_scope === 'org')
+  const privatePools = pools.data.items.filter(p => p.share_scope === 'private')
 
   return {
     totalCandidates: candidates.data.total,
     totalPools: pools.data.items.length,
-    publicPools: publicPools.length,
+    orgPools: orgPools.length,
     privatePools: privatePools.length,
-    publicCandidates: publicPools.reduce((sum, p) => sum + p.candidate_count, 0),
+    orgCandidates: orgPools.reduce((sum, p) => sum + p.candidate_count, 0),
     privateCandidates: privatePools.reduce((sum, p) => sum + p.candidate_count, 0)
   }
 }
