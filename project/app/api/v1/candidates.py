@@ -1,9 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Header, BackgroundTasks
+from fastapi.responses import FileResponse
 import re
+import asyncio
+import os
 from sqlalchemy import select, func
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from app.db import get_db
+from app.db import get_db, get_db_context
 from app.models import Candidate, Tag, Resume, TalentPool
 from app.schemas import (
     CandidateCreate, CandidateUpdate, CandidateResponse, CandidateListResponse
@@ -101,6 +104,74 @@ async def list_candidates(
     return CandidateListResponse(items=candidates, total=total or 0, page=page, page_size=page_size)
 
 
+# ==================== Deduplication Endpoints ====================
+
+@router.get("/duplicates")
+async def get_duplicates(db: AsyncSession = Depends(get_db)):
+    """
+    Find all duplicate candidate groups.
+
+    Returns groups of candidates that match by:
+    - Phone number (highest confidence)
+    - Email address (high confidence)
+    - Name + Company (lower confidence)
+    """
+    from app.services.dedup_service import DeduplicationService
+
+    dedup = DeduplicationService(db)
+    groups = await dedup.find_duplicates()
+    stats = await dedup.get_duplicate_stats()
+
+    return {
+        "stats": stats,
+        "groups": [g.to_dict() for g in groups]
+    }
+
+
+@router.post("/merge")
+async def merge_candidates_endpoint(
+    primary_id: int = Query(..., description="ID of the primary candidate to keep"),
+    duplicate_ids: list[int] = Query(..., description="IDs of duplicates to merge into primary"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Merge duplicate candidates into a primary candidate.
+
+    This will:
+    - Move all resumes to the primary candidate
+    - Merge tags (union)
+    - Merge pool memberships
+    - Fill empty fields from duplicates
+    - Delete the duplicate candidates
+    """
+    from app.services.dedup_service import DeduplicationService
+
+    dedup = DeduplicationService(db)
+    try:
+        result = await dedup.merge_candidates(primary_id, duplicate_ids)
+        return {"message": "Candidates merged successfully", **result}
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+
+
+@router.post("/auto-dedup")
+async def auto_deduplicate(db: AsyncSession = Depends(get_db)):
+    """
+    Automatically merge all duplicate candidate groups.
+
+    Uses the most complete candidate as primary in each group.
+    """
+    from app.services.dedup_service import DeduplicationService
+
+    dedup = DeduplicationService(db)
+    result = await dedup.auto_merge_all()
+
+    return {
+        "message": "Auto-deduplication completed",
+        **result
+    }
+
+
 @router.get("/{candidate_id}", response_model=CandidateResponse)
 async def get_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)):
     stmt = select(Candidate).options(selectinload(Candidate.tags)).where(Candidate.id == candidate_id)
@@ -144,34 +215,110 @@ async def delete_candidate(candidate_id: int, db: AsyncSession = Depends(get_db)
     return {"message": "Candidate deleted"}
 
 
+async def find_existing_candidate(db: AsyncSession, phone: str = None, email: str = None, name: str = None) -> Candidate | None:
+    """通过手机号、邮箱或姓名查找已存在的候选人"""
+    if phone:
+        stmt = select(Candidate).where(Candidate.phone == phone)
+        result = await db.execute(stmt)
+        candidate = result.scalar_one_or_none()
+        if candidate:
+            return candidate
+
+    if email:
+        stmt = select(Candidate).where(Candidate.email == email)
+        result = await db.execute(stmt)
+        candidate = result.scalar_one_or_none()
+        if candidate:
+            return candidate
+
+    # 姓名匹配作为最后手段（可能不准确，但可以减少明显重复）
+    if name and name != "未知姓名":
+        stmt = select(Candidate).where(Candidate.name == name)
+        result = await db.execute(stmt)
+        candidate = result.scalar_one_or_none()
+        if candidate:
+            return candidate
+
+    return None
+
+
+def merge_candidate_data(existing: Candidate, new_data: dict, new_skills: list = None) -> bool:
+    """
+    合并候选人数据 - 只补充空字段，不覆盖已有数据
+    返回是否有更新
+    """
+    updated = False
+
+    # 可合并的字段列表
+    mergeable_fields = [
+        'phone', 'email', 'city', 'current_company', 'current_title',
+        'years_of_experience', 'expected_salary', 'summary'
+    ]
+
+    for field in mergeable_fields:
+        existing_value = getattr(existing, field, None)
+        new_value = new_data.get(field)
+        # 只有当现有值为空且新值不为空时才更新
+        if (existing_value is None or existing_value == "") and new_value:
+            setattr(existing, field, new_value)
+            updated = True
+
+    # 合并技能 - 追加新技能
+    if new_skills:
+        existing_skills = []
+        if existing.skills:
+            try:
+                existing_skills = json.loads(existing.skills)
+            except:
+                existing_skills = [s.strip() for s in existing.skills.split(',') if s.strip()]
+
+        # 合并并去重
+        merged_skills = list(set(existing_skills + new_skills))
+        if len(merged_skills) > len(existing_skills):
+            existing.skills = json.dumps(merged_skills, ensure_ascii=False)
+            updated = True
+
+    return updated
+
+
 @router.post("/import")
 async def import_resume(
     file: UploadFile = File(...),
+    background_tasks: BackgroundTasks = None,
     db: AsyncSession = Depends(get_db),
     current_user: str = Depends(get_current_user)
 ):
+    """
+    快速导入简历（毫秒级入库）
+    1. 快速提取文本 + 正则提取关键字段
+    2. 立即入库
+    3. 后台异步 AI 精细解析
+    """
     parser = ResumeParser()
     content = await file.read()
 
     try:
-        result = await parser.parse(file.filename, content)
+        # 使用快速解析模式（不调用 AI）
+        result = await parser.quick_parse(file.filename, content)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"文件解析失败: {str(e)}")
 
     parsed = result["parsed_data"]
     raw_text = result.get("raw_text", "")
 
-    # 检查是否提取到文本
-    if not raw_text or len(raw_text.strip()) < 10:
+    # 图片版 PDF 暂时允许入库（标记为待 AI 识别）
+    if result.get("extraction_method") == "pending_vision":
+        # 图片版 PDF，文本较少但仍然入库
+        pass
+    elif not raw_text or len(raw_text.strip()) < 10:
         raise HTTPException(
             status_code=400,
-            detail=f"无法从文件中提取文本内容。文件可能是扫描版 PDF 或格式不支持。提取到的内容长度: {len(raw_text) if raw_text else 0}"
+            detail=f"无法从文件中提取文本内容。文件可能是扫描版 PDF 或格式不支持。"
         )
 
     # 检查必填字段 name
     name = parsed.get("name")
     if not name:
-        # 尝试从文件名提取姓名
         name = extract_name_from_filename(file.filename)
         if not name:
             name = "未知姓名"
@@ -179,11 +326,30 @@ async def import_resume(
 
     skills = parsed.pop("skills", [])
 
-    candidate = Candidate(
-        **{k: v for k, v in parsed.items() if hasattr(Candidate, k) and v is not None},
-        skills=json.dumps(skills, ensure_ascii=False) if skills else None
+    # 检查是否已存在该候选人（通过手机号、邮箱或姓名）
+    existing_candidate = await find_existing_candidate(
+        db,
+        phone=parsed.get("phone"),
+        email=parsed.get("email"),
+        name=parsed.get("name")
     )
-    db.add(candidate)
+
+    is_merged = False
+    if existing_candidate:
+        # 合并数据到已存在的候选人
+        is_merged = merge_candidate_data(existing_candidate, parsed, skills)
+        candidate = existing_candidate
+        if is_merged:
+            candidate.parse_status = "pending"  # 重新标记为待解析
+    else:
+        # 创建新候选人
+        candidate = Candidate(
+            **{k: v for k, v in parsed.items() if hasattr(Candidate, k) and v is not None},
+            skills=json.dumps(skills, ensure_ascii=False) if skills else None,
+            parse_status="pending"
+        )
+        db.add(candidate)
+
     await db.commit()
     await db.refresh(candidate)
 
@@ -206,18 +372,120 @@ async def import_resume(
         pool.candidates.append(candidate)
 
     await db.commit()
+    await db.refresh(resume)  # 获取 resume.id
 
-    return {"candidate_id": candidate.id, "parsed": result["parsed_data"], "pool_id": pool.id}
+    # 后台异步 AI 精细解析 + 结构化 Profile
+    if background_tasks and raw_text and len(raw_text.strip()) >= 20:
+        background_tasks.add_task(
+            background_ai_parse,
+            candidate.id,
+            raw_text,
+            resume.id  # 传递 resume_id 用于保存结构化 profile
+        )
+
+    return {
+        "candidate_id": candidate.id,
+        "parsed": result["parsed_data"],
+        "pool_id": pool.id,
+        "parse_status": "pending",
+        "is_merged": is_merged  # 标识是否为合并操作
+    }
+
+
+async def background_ai_parse(candidate_id: int, raw_text: str, resume_id: int = None):
+    """后台 AI 精细解析任务 + 结构化 Profile 生成"""
+    from app.services.ai_service import AIService
+    parser = ResumeParser()
+    ai = AIService()
+
+    try:
+        # 使用独立的数据库会话
+        async with get_db_context() as db:
+            # 更新状态为解析中
+            stmt = select(Candidate).where(Candidate.id == candidate_id)
+            result = await db.execute(stmt)
+            candidate = result.scalar_one_or_none()
+            if not candidate:
+                return
+
+            candidate.parse_status = "parsing"
+            await db.commit()
+
+            # 1. 基本信息 AI 解析
+            parsed = await parser.ai_parse_text(raw_text)
+
+            if parsed:
+                # 更新候选人信息（只更新之前为空的字段）
+                if parsed.get("name") and candidate.name == "未知姓名":
+                    candidate.name = parsed["name"]
+                if parsed.get("phone") and not candidate.phone:
+                    candidate.phone = parsed["phone"]
+                if parsed.get("email") and not candidate.email:
+                    candidate.email = parsed["email"]
+                if parsed.get("city") and not candidate.city:
+                    candidate.city = parsed["city"]
+                if parsed.get("current_company") and not candidate.current_company:
+                    candidate.current_company = parsed["current_company"]
+                if parsed.get("current_title") and not candidate.current_title:
+                    candidate.current_title = parsed["current_title"]
+                if parsed.get("years_of_experience") and not candidate.years_of_experience:
+                    candidate.years_of_experience = parsed["years_of_experience"]
+                if parsed.get("expected_salary") and not candidate.expected_salary:
+                    candidate.expected_salary = parsed["expected_salary"]
+                if parsed.get("skills"):
+                    skills = parsed["skills"]
+                    candidate.skills = json.dumps(skills, ensure_ascii=False) if isinstance(skills, list) else skills
+                if parsed.get("summary") and not candidate.summary:
+                    candidate.summary = parsed["summary"]
+
+            # 2. 结构化 Profile 解析
+            print(f"开始结构化 Profile 解析: candidate_id={candidate_id}")
+            structured_profile = await ai.parse_resume_structured(raw_text)
+
+            if structured_profile and resume_id:
+                # 保存到 Resume 的 parsed_data
+                from app.models import Resume
+                resume_stmt = select(Resume).where(Resume.id == resume_id)
+                resume_result = await db.execute(resume_stmt)
+                resume = resume_result.scalar_one_or_none()
+                if resume:
+                    resume.parsed_data = json.dumps(structured_profile, ensure_ascii=False)
+                    print(f"结构化 Profile 已保存: resume_id={resume_id}")
+
+            candidate.parse_status = "completed"
+            await db.commit()
+            print(f"AI 解析完成: candidate_id={candidate_id}, status={candidate.parse_status}")
+
+    except Exception as e:
+        print(f"后台 AI 解析失败: candidate_id={candidate_id}, error={e}")
+        import traceback
+        traceback.print_exc()
+        try:
+            async with get_db_context() as db:
+                stmt = select(Candidate).where(Candidate.id == candidate_id)
+                result = await db.execute(stmt)
+                candidate = result.scalar_one_or_none()
+                if candidate:
+                    candidate.parse_status = "failed"
+                    await db.commit()
+        except:
+            pass
 
 
 @router.post("/import/batch")
 async def import_resumes_batch(
     files: list[UploadFile] = File(...),
+    background_tasks: BackgroundTasks = None,
     db: AsyncSession = Depends(get_db),
     current_user: str = Depends(get_current_user)
 ):
+    """
+    批量快速导入简历
+    使用快速解析模式，后台异步 AI 精细解析
+    """
     parser = ResumeParser()
     results = []
+    candidates_to_parse = []  # 收集需要后台解析的候选人
 
     # 获取或创建用户的人才库
     pool = await get_or_create_user_pool(db, current_user)
@@ -225,16 +493,19 @@ async def import_resumes_batch(
     for file in files:
         try:
             content = await file.read()
-            result = await parser.parse(file.filename, content)
+            # 使用快速解析模式
+            result = await parser.quick_parse(file.filename, content)
             parsed = result["parsed_data"]
             raw_text = result.get("raw_text", "")
 
-            # 检查是否提取到文本
-            if not raw_text or len(raw_text.strip()) < 10:
+            # 图片版 PDF 暂时允许入库
+            if result.get("extraction_method") == "pending_vision":
+                pass
+            elif not raw_text or len(raw_text.strip()) < 10:
                 results.append({
                     "success": False,
                     "filename": file.filename,
-                    "error": f"无法从文件中提取文本内容 (长度: {len(raw_text) if raw_text else 0})"
+                    "error": f"无法从文件中提取文本内容"
                 })
                 continue
 
@@ -250,7 +521,8 @@ async def import_resumes_batch(
 
             candidate = Candidate(
                 **{k: v for k, v in parsed.items() if hasattr(Candidate, k) and v is not None},
-                skills=json.dumps(skills, ensure_ascii=False) if skills else None
+                skills=json.dumps(skills, ensure_ascii=False) if skills else None,
+                parse_status="pending"
             )
             db.add(candidate)
             await db.commit()
@@ -274,12 +546,22 @@ async def import_resumes_batch(
                 pool_with_candidates.candidates.append(candidate)
 
             await db.commit()
+            await db.refresh(resume)  # 获取 resume.id
+
+            # 收集需要后台解析的候选人
+            if raw_text and len(raw_text.strip()) >= 20:
+                candidates_to_parse.append((candidate.id, raw_text, resume.id))
 
             results.append({"success": True, "filename": file.filename, "candidate_id": candidate.id})
         except Exception as e:
             # 回滚当前事务以便继续处理下一个文件
             await db.rollback()
             results.append({"success": False, "filename": file.filename, "error": str(e)})
+
+    # 批量添加后台解析任务
+    if background_tasks and candidates_to_parse:
+        for candidate_id, raw_text, resume_id in candidates_to_parse:
+            background_tasks.add_task(background_ai_parse, candidate_id, raw_text, resume_id)
 
     return {"results": results, "pool_id": pool.id}
 
@@ -377,6 +659,113 @@ async def get_candidate_profile(candidate_id: int, db: AsyncSession = Depends(ge
         "generated_at": profile.generated_at,
         "created_at": profile.created_at,
         "updated_at": profile.updated_at
+    }
+
+
+@router.get("/{candidate_id}/structured-profile")
+async def get_structured_profile(candidate_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    获取候选人的结构化 Profile（从简历解析）
+    包含：基本信息、工作经历、教育背景、项目经历、技能等
+    """
+    # 查找候选人
+    stmt = select(Candidate).where(Candidate.id == candidate_id).options(selectinload(Candidate.resumes))
+    result = await db.execute(stmt)
+    candidate = result.scalar_one_or_none()
+
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    # 查找最新的简历解析数据
+    if not candidate.resumes:
+        raise HTTPException(status_code=404, detail="No resume found for this candidate")
+
+    # 获取最新的简历
+    latest_resume = max(candidate.resumes, key=lambda r: r.created_at)
+
+    # 检查是否有结构化数据
+    if latest_resume.parsed_data:
+        try:
+            parsed = json.loads(latest_resume.parsed_data)
+            # 检查是否是新的结构化格式（有 work_experience 字段）
+            if "work_experience" in parsed or "basic_info" in parsed:
+                return {
+                    "candidate_id": candidate_id,
+                    "resume_id": latest_resume.id,
+                    "profile": parsed,
+                    "raw_text": latest_resume.raw_text or "",
+                    "generated_at": latest_resume.created_at.isoformat() if latest_resume.created_at else None
+                }
+        except json.JSONDecodeError:
+            pass
+
+    # 没有结构化数据，返回 404
+    raise HTTPException(
+        status_code=404,
+        detail="Structured profile not generated yet. Use POST to generate."
+    )
+
+
+@router.post("/{candidate_id}/structured-profile/generate")
+async def generate_structured_profile(
+    candidate_id: int,
+    force: bool = Query(False, description="Force regenerate even if profile exists"),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    生成候选人的结构化 Profile
+    从简历原文重新解析，提取完整的工作经历、教育背景等
+    """
+    from app.services.ai_service import AIService
+
+    # 查找候选人和简历
+    stmt = select(Candidate).where(Candidate.id == candidate_id).options(selectinload(Candidate.resumes))
+    result = await db.execute(stmt)
+    candidate = result.scalar_one_or_none()
+
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    if not candidate.resumes:
+        raise HTTPException(status_code=404, detail="No resume found for this candidate")
+
+    # 获取最新的简历
+    latest_resume = max(candidate.resumes, key=lambda r: r.created_at)
+
+    # 检查是否已有结构化数据（除非 force=True）
+    if not force and latest_resume.parsed_data:
+        try:
+            parsed = json.loads(latest_resume.parsed_data)
+            if "work_experience" in parsed or "basic_info" in parsed:
+                return {
+                    "candidate_id": candidate_id,
+                    "resume_id": latest_resume.id,
+                    "profile": parsed,
+                    "message": "Profile already exists. Use force=true to regenerate."
+                }
+        except json.JSONDecodeError:
+            pass
+
+    # 检查是否有原文
+    if not latest_resume.raw_text:
+        raise HTTPException(status_code=400, detail="Resume raw text not available")
+
+    # 使用 AI 解析
+    ai = AIService()
+    structured_data = await ai.parse_resume_structured(latest_resume.raw_text)
+
+    if not structured_data:
+        raise HTTPException(status_code=500, detail="Failed to parse resume")
+
+    # 保存到数据库
+    latest_resume.parsed_data = json.dumps(structured_data, ensure_ascii=False)
+    await db.commit()
+
+    return {
+        "candidate_id": candidate_id,
+        "resume_id": latest_resume.id,
+        "profile": structured_data,
+        "message": "Profile generated successfully"
     }
 
 
@@ -495,3 +884,39 @@ async def add_recruiter_note(
     ckb = CKBService(db)
     await ckb.record_feedback(candidate_id, "note", note)
     return {"message": "Note added"}
+
+
+@router.get("/{candidate_id}/resume/download")
+async def download_resume(candidate_id: int, db: AsyncSession = Depends(get_db)):
+    """
+    下载候选人的原始简历文件 (PDF/DOCX)
+    """
+    # 查找候选人和简历
+    stmt = select(Candidate).where(Candidate.id == candidate_id).options(selectinload(Candidate.resumes))
+    result = await db.execute(stmt)
+    candidate = result.scalar_one_or_none()
+
+    if not candidate:
+        raise HTTPException(status_code=404, detail="Candidate not found")
+
+    if not candidate.resumes:
+        raise HTTPException(status_code=404, detail="No resume found for this candidate")
+
+    # 获取最新的简历
+    latest_resume = max(candidate.resumes, key=lambda r: r.created_at)
+
+    if not latest_resume.file_path or not os.path.exists(latest_resume.file_path):
+        raise HTTPException(status_code=404, detail="Resume file not found on disk")
+
+    # 确定 media type
+    media_type = "application/pdf"
+    if latest_resume.file_type == "docx":
+        media_type = "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+    elif latest_resume.file_type == "doc":
+        media_type = "application/msword"
+
+    return FileResponse(
+        path=latest_resume.file_path,
+        filename=latest_resume.file_name or f"{candidate.name}_简历.{latest_resume.file_type or 'pdf'}",
+        media_type=media_type
+    )

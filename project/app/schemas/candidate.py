@@ -155,6 +155,7 @@ class CandidateResponse(CandidateBase):
     created_at: datetime
     updated_at: datetime
     tags: list[TagResponse] = []
+    parse_status: str | None = None  # pending, parsing, completed, failed
 
     class Config:
         from_attributes = True

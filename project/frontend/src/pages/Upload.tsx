@@ -1,8 +1,10 @@
 import { useState, useRef, useCallback } from 'react'
-import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query'
-import { Upload as UploadIcon, FolderOpen, File, CheckCircle, XCircle, Loader2, AlertCircle, Clock } from 'lucide-react'
+import { useMutation, useQueryClient } from '@tanstack/react-query'
+import { Link } from 'react-router-dom'
+import { Upload as UploadIcon, FolderOpen, File, CheckCircle, XCircle, Loader2, AlertCircle, Clock, ArrowRight } from 'lucide-react'
 import clsx from 'clsx'
-import { uploadResumeBatch, getPools, addCandidateToPool, UploadProgress } from '../services/api'
+import { uploadResumeBatch, UploadProgress } from '../services/api'
+import { useToast } from '../components/Toast'
 
 type FileStatus = 'pending' | 'uploading' | 'parsing' | 'done' | 'error'
 
@@ -16,16 +18,12 @@ interface FileWithStatus {
 export default function Upload() {
   const [filesWithStatus, setFilesWithStatus] = useState<FileWithStatus[]>([])
   const [progress, setProgress] = useState<UploadProgress | null>(null)
-  const [selectedPool, setSelectedPool] = useState<number | null>(null)
   const [isDragging, setIsDragging] = useState(false)
+  const [uploadComplete, setUploadComplete] = useState(false)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const folderInputRef = useRef<HTMLInputElement>(null)
   const queryClient = useQueryClient()
-
-  const { data: pools } = useQuery({
-    queryKey: ['pools'],
-    queryFn: () => getPools()
-  })
+  const { showToast } = useToast()
 
   const updateFileStatus = useCallback((filename: string, status: FileStatus, error?: string, candidateId?: number) => {
     setFilesWithStatus(prev => prev.map(f =>
@@ -54,24 +52,42 @@ export default function Upload() {
         }
       })
 
-      // Add to pool if selected
-      if (selectedPool) {
-        for (const r of uploadResults) {
-          if (r.success && r.candidate_id) {
-            try {
-              await addCandidateToPool(selectedPool, r.candidate_id)
-            } catch (e) {
-              console.error('Failed to add to pool:', e)
-            }
-          }
-        }
-      }
-
       return uploadResults
     },
-    onSuccess: () => {
+    onSuccess: (results) => {
       queryClient.invalidateQueries({ queryKey: ['stats'] })
       queryClient.invalidateQueries({ queryKey: ['pools'] })
+      setUploadComplete(true)
+
+      const successCount = results.filter(r => r.success).length
+      const failCount = results.filter(r => !r.success).length
+
+      if (failCount === 0) {
+        showToast({
+          type: 'success',
+          title: '上传完成',
+          message: `成功导入 ${successCount} 份简历`
+        })
+      } else if (successCount === 0) {
+        showToast({
+          type: 'error',
+          title: '上传失败',
+          message: `${failCount} 份简历全部解析失败`
+        })
+      } else {
+        showToast({
+          type: 'warning',
+          title: '部分上传成功',
+          message: `成功 ${successCount} 份，失败 ${failCount} 份`
+        })
+      }
+    },
+    onError: (error) => {
+      showToast({
+        type: 'error',
+        title: '上传失败',
+        message: error instanceof Error ? error.message : '未知错误'
+      })
     }
   })
 
@@ -90,12 +106,12 @@ export default function Upload() {
     setProgress(null)
   }, [])
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
+  const handleDrop = useCallback(async (e: React.DragEvent) => {
     e.preventDefault()
     setIsDragging(false)
 
     const items = e.dataTransfer.items
-    const filePromises: Promise<File>[] = []
+    const allFiles: File[] = []
 
     for (let i = 0; i < items.length; i++) {
       const item = items[i]
@@ -103,26 +119,31 @@ export default function Upload() {
         const entry = item.webkitGetAsEntry?.()
         if (entry) {
           if (entry.isDirectory) {
-            filePromises.push(...traverseDirectory(entry as FileSystemDirectoryEntry))
+            const files = await traverseDirectory(entry as FileSystemDirectoryEntry)
+            allFiles.push(...files)
           } else {
             const file = item.getAsFile()
-            if (file) filePromises.push(Promise.resolve(file))
+            if (file) allFiles.push(file)
           }
         }
       }
     }
 
-    Promise.all(filePromises).then(files => handleFiles(files))
+    handleFiles(allFiles)
   }, [handleFiles])
 
-  const traverseDirectory = (dir: FileSystemDirectoryEntry): Promise<File>[] => {
-    const promises: Promise<File>[] = []
-    const reader = dir.createReader()
+  const traverseDirectory = (dir: FileSystemDirectoryEntry): Promise<File[]> => {
+    return new Promise((resolve) => {
+      const reader = dir.createReader()
+      const allFiles: File[] = []
 
-    const readEntries = (): Promise<File[]> => {
-      return new Promise((resolve) => {
+      const readEntries = () => {
         reader.readEntries(async (entries) => {
-          const files: File[] = []
+          if (entries.length === 0) {
+            resolve(allFiles)
+            return
+          }
+
           for (const entry of entries) {
             if (entry.isFile) {
               const file = await new Promise<File>((res) => {
@@ -131,25 +152,20 @@ export default function Upload() {
               if (file.name.toLowerCase().endsWith('.pdf') ||
                   file.name.toLowerCase().endsWith('.docx') ||
                   file.name.toLowerCase().endsWith('.doc')) {
-                files.push(file)
+                allFiles.push(file)
               }
             } else if (entry.isDirectory) {
-              const subFiles = await Promise.all(traverseDirectory(entry as FileSystemDirectoryEntry))
-              files.push(...subFiles)
+              const subFiles = await traverseDirectory(entry as FileSystemDirectoryEntry)
+              allFiles.push(...subFiles)
             }
           }
-          if (entries.length > 0) {
-            const moreFiles = await readEntries()
-            resolve([...files, ...moreFiles])
-          } else {
-            resolve(files)
-          }
+          // Continue reading (directories can have batched entries)
+          readEntries()
         })
-      })
-    }
+      }
 
-    promises.push(readEntries().then(files => files).then(f => f[0] || new File([], '')))
-    return promises
+      readEntries()
+    })
   }
 
   const handleFolderSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -167,6 +183,7 @@ export default function Upload() {
   const clearFiles = () => {
     setFilesWithStatus([])
     setProgress(null)
+    setUploadComplete(false)
   }
 
   const successCount = filesWithStatus.filter(f => f.status === 'done').length
@@ -204,26 +221,31 @@ export default function Upload() {
       <div className="flex items-center justify-between">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">批量导入简历</h1>
-          <p className="text-gray-500 mt-1">支持 PDF、Word 格式，可一次性上传大量文件或整个文件夹</p>
+          <p className="text-gray-500 mt-1">支持 PDF、Word 格式，上传后自动加入您的人才库</p>
         </div>
       </div>
 
-      {/* Pool Selection */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <h2 className="font-semibold text-gray-900 mb-3">导入到人才库（可选）</h2>
-        <select
-          value={selectedPool || ''}
-          onChange={(e) => setSelectedPool(e.target.value ? Number(e.target.value) : null)}
-          className="w-full max-w-md px-3 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-blue-500"
-        >
-          <option value="">不指定人才库（仅建档）</option>
-          {pools?.map(pool => (
-            <option key={pool.id} value={pool.id}>
-              {pool.share_scope === 'org' ? '🏢' : pool.share_scope === 'custom' ? '👥' : '🔒'} {pool.name} ({pool.candidate_count} 人)
-            </option>
-          ))}
-        </select>
-      </div>
+      {/* Upload Complete Banner */}
+      {uploadComplete && successCount > 0 && (
+        <div className="bg-green-50 border border-green-200 rounded-xl p-4">
+          <div className="flex items-center justify-between">
+            <div className="flex items-center gap-3">
+              <CheckCircle className="w-6 h-6 text-green-600" />
+              <div>
+                <p className="font-medium text-green-800">导入完成！</p>
+                <p className="text-sm text-green-600">成功导入 {successCount} 份简历到您的人才库</p>
+              </div>
+            </div>
+            <Link
+              to="/pools"
+              className="flex items-center gap-2 px-4 py-2 bg-green-600 text-white rounded-lg hover:bg-green-700 transition-colors"
+            >
+              查看人才库
+              <ArrowRight className="w-4 h-4" />
+            </Link>
+          </div>
+        </div>
+      )}
 
       {/* Upload Area */}
       <div

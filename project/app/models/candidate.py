@@ -53,6 +53,9 @@ class Candidate(Base):
     # Track who imported this candidate
     imported_by: Mapped[str | None] = mapped_column(String(100), index=True)
 
+    # Parse status: pending (快速入库), parsing (AI解析中), completed (解析完成), failed (解析失败)
+    parse_status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
+
     # Timestamps
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
@@ -96,7 +99,10 @@ class TalentPool(Base):
     description: Mapped[str | None] = mapped_column(Text)
 
     # 所有者 (必填)
-    owner_id: Mapped[str] = mapped_column(String(100), index=True)
+    owner_id: Mapped[str | None] = mapped_column(String(100), index=True)
+
+    # 旧字段，保留兼容性
+    is_public: Mapped[bool] = mapped_column(Boolean, default=False)
 
     # 共享范围
     share_scope: Mapped[str] = mapped_column(String(20), default="private")  # private, team, org, custom

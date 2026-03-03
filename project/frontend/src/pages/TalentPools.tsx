@@ -17,7 +17,6 @@ const SCOPE_CONFIG: Record<ShareScope, { icon: typeof Lock; label: string; color
 
 export default function TalentPools() {
   const [showSettings, setShowSettings] = useState(false)
-  const queryClient = useQueryClient()
 
   const { data: pools, isLoading } = useQuery({
     queryKey: ['pools'],

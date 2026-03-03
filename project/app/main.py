@@ -6,6 +6,7 @@ from app.core import get_settings
 from app.db import engine, redis_client, Base, AsyncSessionLocal
 from app.api.v1.router import api_router
 from app.models import TalentPool
+from app.services import close_es_service
 
 settings = get_settings()
 
@@ -15,10 +16,13 @@ PUBLIC_POOL_DESCRIPTION = "所有猎头共享的人才库，所有人可见"
 
 
 async def ensure_public_pool_exists():
-    """Ensure the system has exactly one public pool"""
+    """Ensure the system has exactly one org-wide shared pool"""
     async with AsyncSessionLocal() as db:
         result = await db.execute(
-            select(TalentPool).where(TalentPool.is_public == True)
+            select(TalentPool).where(
+                TalentPool.share_scope == "org",
+                TalentPool.name == PUBLIC_POOL_NAME
+            )
         )
         public_pool = result.scalar_one_or_none()
 
@@ -26,8 +30,9 @@ async def ensure_public_pool_exists():
             public_pool = TalentPool(
                 name=PUBLIC_POOL_NAME,
                 description=PUBLIC_POOL_DESCRIPTION,
+                share_scope="org",
                 is_public=True,
-                owner_id=None  # System owned
+                owner_id="system"
             )
             db.add(public_pool)
             await db.commit()
@@ -47,6 +52,7 @@ async def lifespan(app: FastAPI):
     # Shutdown
     await engine.dispose()
     await redis_client.close()
+    await close_es_service()
 
 
 app = FastAPI(
@@ -56,10 +62,10 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-# CORS for frontend
+# CORS for frontend - allow all origins for local network access
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],

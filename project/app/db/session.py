@@ -1,3 +1,4 @@
+from contextlib import asynccontextmanager
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.orm import DeclarativeBase
 from app.core import get_settings
@@ -22,6 +23,16 @@ class Base(DeclarativeBase):
 
 
 async def get_db() -> AsyncSession:
+    async with AsyncSessionLocal() as session:
+        try:
+            yield session
+        finally:
+            await session.close()
+
+
+@asynccontextmanager
+async def get_db_context():
+    """用于后台任务的数据库会话上下文管理器"""
     async with AsyncSessionLocal() as session:
         try:
             yield session

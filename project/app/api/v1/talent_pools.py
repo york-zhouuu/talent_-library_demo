@@ -2,11 +2,13 @@ from fastapi import APIRouter, Depends, Query, Header
 from sqlalchemy import select, func, or_, and_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+import json
 from app.db import get_db
-from app.models import TalentPool, Candidate, candidate_pools, pool_shares
+from app.models import TalentPool, Candidate, Resume, candidate_pools, pool_shares
 from app.schemas import (
     TalentPoolCreate, TalentPoolUpdate, TalentPoolResponse,
-    ShareScope, PoolShareCreate, PoolShareResponse
+    ShareScope, PoolShareCreate, PoolShareResponse,
+    CandidateResponse
 )
 from app.core import NotFoundError, ValidationError
 
@@ -441,6 +443,7 @@ async def list_pool_candidates(
         select(Candidate)
         .join(candidate_pools)
         .where(candidate_pools.c.pool_id == pool_id)
+        .options(selectinload(Candidate.tags), selectinload(Candidate.resumes))
         .offset(offset)
         .limit(page_size)
     )
@@ -452,4 +455,38 @@ async def list_pool_candidates(
     )
     total = await db.scalar(count_stmt) or 0
 
-    return {"items": candidates, "total": total, "page": page, "page_size": page_size}
+    # Serialize with additional fields from structured profile
+    items = []
+    for c in candidates:
+        item = CandidateResponse.model_validate(c).model_dump()
+
+        # Extract school and work info from structured profile
+        school = None
+        latest_work = None
+
+        if c.resumes:
+            latest_resume = max(c.resumes, key=lambda r: r.created_at)
+            if latest_resume.parsed_data:
+                try:
+                    parsed = json.loads(latest_resume.parsed_data)
+                    # Extract school
+                    if parsed.get("education") and len(parsed["education"]) > 0:
+                        edu = parsed["education"][0]
+                        school = edu.get("school")
+                    # Extract latest work
+                    if parsed.get("work_experience") and len(parsed["work_experience"]) > 0:
+                        work = parsed["work_experience"][0]
+                        latest_work = {
+                            "company": work.get("company"),
+                            "title": work.get("title")
+                        }
+                except json.JSONDecodeError:
+                    pass
+
+        item["school"] = school
+        item["latest_work"] = latest_work
+        # Activity level based on parse_status and updated_at
+        item["activity"] = "active" if c.parse_status == "completed" else "pending"
+        items.append(item)
+
+    return {"items": items, "total": total, "page": page, "page_size": page_size}

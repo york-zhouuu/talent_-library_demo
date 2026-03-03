@@ -9,9 +9,16 @@ class Settings(BaseSettings):
     # Redis
     redis_url: str = "redis://localhost:6379"
 
+    # Elasticsearch
+    elasticsearch_url: str = "http://localhost:9200"
+    es_index_name: str = "candidates"
+
     # Anthropic Claude API
     anthropic_api_key: str = ""
     anthropic_base_url: str = ""
+
+    # Google Gemini API (用于简历解析，更快)
+    gemini_api_key: str = ""
 
     # Application
     app_env: str = "development"

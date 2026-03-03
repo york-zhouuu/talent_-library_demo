@@ -1,9 +1,34 @@
-import axios from 'axios'
+import axios, { AxiosError } from 'axios'
 
 const api = axios.create({
   baseURL: '/api/v1',
   timeout: 300000 // 5 minutes for large uploads
 })
+
+// API Error types
+export interface ApiErrorResponse {
+  detail?: string
+  message?: string
+  error?: string
+}
+
+export function isAxiosError(error: unknown): error is AxiosError<ApiErrorResponse> {
+  return axios.isAxiosError(error)
+}
+
+export function getErrorMessage(error: unknown): string {
+  if (isAxiosError(error)) {
+    return error.response?.data?.detail
+      || error.response?.data?.message
+      || error.response?.data?.error
+      || error.message
+      || '请求失败'
+  }
+  if (error instanceof Error) {
+    return error.message
+  }
+  return '未知错误'
+}
 
 // 共享范围
 export type ShareScope = 'private' | 'team' | 'org' | 'custom'
@@ -40,6 +65,26 @@ export interface Candidate {
   skills: string | null
   summary: string | null
   tags: { id: number; name: string }[]
+  parse_status?: 'pending' | 'parsing' | 'completed' | 'failed'
+  // Additional fields from structured profile
+  school?: string | null
+  latest_work?: { company?: string; title?: string } | null
+  activity?: 'active' | 'pending'
+}
+
+export interface CandidateProfile {
+  id: number
+  candidate_id: number
+  one_liner: string | null
+  highlights: string[]
+  potential_concerns: string[]
+  skills_with_confidence: { skill: string; confidence: number; source: string }[]
+  conflicts: { field: string; layer1_value: unknown; layer2_value: unknown }[]
+  profile_version: number
+  model_version: string | null
+  generated_at: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface UploadProgress {
@@ -129,6 +174,116 @@ export const getCandidate = async (id: number) => {
   return res.data
 }
 
+export const getCandidateProfile = async (id: number) => {
+  const res = await api.get<CandidateProfile>(`/candidates/${id}/profile`)
+  return res.data
+}
+
+export const generateCandidateProfile = async (id: number, force = false) => {
+  const res = await api.post(`/candidates/${id}/profile/generate`, null, {
+    params: { force }
+  })
+  return res.data
+}
+
+// Structured Profile (详细简历解析)
+export interface WorkExperience {
+  company: string
+  title: string
+  department?: string
+  start_date?: string
+  end_date?: string
+  is_current?: boolean
+  location?: string
+  responsibilities?: string[]
+  achievements?: string[]
+  tech_stack?: string[]
+}
+
+export interface Education {
+  school: string
+  degree?: string
+  major?: string
+  start_date?: string
+  end_date?: string
+  gpa?: string
+  honors?: string[]
+}
+
+export interface Project {
+  name: string
+  role?: string
+  period?: string
+  description?: string
+  highlights?: string[]
+  tech_stack?: string[]
+}
+
+export interface Certification {
+  name: string
+  issuer?: string
+  date?: string
+}
+
+export interface StructuredProfile {
+  basic_info?: {
+    name?: string
+    gender?: string
+    birth_year?: number
+    phone?: string
+    email?: string
+    city?: string
+    current_status?: string
+  }
+  career_summary?: {
+    current_company?: string
+    current_title?: string
+    years_of_experience?: number
+    expected_salary?: number
+    expected_salary_range?: string
+    one_liner?: string
+  }
+  work_experience?: WorkExperience[]
+  education?: Education[]
+  projects?: Project[]
+  skills?: {
+    technical?: string[]
+    languages?: { language: string; level: string }[]
+    tools?: string[]
+    soft_skills?: string[]
+    industries?: string[]
+  }
+  certifications?: Certification[]
+  highlights?: string[]
+  tags?: string[]
+}
+
+export interface StructuredProfileResponse {
+  candidate_id: number
+  resume_id: number
+  profile: StructuredProfile
+  raw_text?: string
+  generated_at?: string
+  message?: string
+}
+
+export const getStructuredProfile = async (id: number): Promise<StructuredProfileResponse> => {
+  const res = await api.get<StructuredProfileResponse>(`/candidates/${id}/structured-profile`)
+  return res.data
+}
+
+export const generateStructuredProfile = async (id: number, force = false): Promise<StructuredProfileResponse> => {
+  const res = await api.post<StructuredProfileResponse>(`/candidates/${id}/structured-profile/generate`, null, {
+    params: { force }
+  })
+  return res.data
+}
+
+// 下载简历 PDF
+export const getResumeDownloadUrl = (candidateId: number): string => {
+  return `/api/v1/candidates/${candidateId}/resume/download`
+}
+
 export const deleteCandidate = async (id: number) => {
   await api.delete(`/candidates/${id}`)
 }
@@ -209,8 +364,7 @@ export const uploadResumeBatch = async (
         })
       }
     } catch (e: unknown) {
-      const error = e as { response?: { data?: { detail?: string } }; message?: string }
-      const errorMsg = error.response?.data?.detail || error.message || 'Upload failed'
+      const errorMsg = getErrorMessage(e)
       results.push({
         success: false,
         filename: file.name,
@@ -312,7 +466,15 @@ export const streamingSearch = async (
     })
 
     if (!response.ok) {
-      throw new Error(`HTTP error! status: ${response.status}`)
+      const errorText = await response.text()
+      let errorMessage = `HTTP ${response.status}`
+      try {
+        const errorJson = JSON.parse(errorText)
+        errorMessage = errorJson.detail || errorJson.message || errorMessage
+      } catch {
+        errorMessage = errorText || errorMessage
+      }
+      throw new Error(errorMessage)
     }
 
     const reader = response.body?.getReader()
@@ -323,28 +485,45 @@ export const streamingSearch = async (
     const decoder = new TextDecoder()
     let buffer = ''
 
+    const processLine = (line: string) => {
+      if (line.startsWith('data: ')) {
+        const jsonStr = line.slice(6).trim()
+        if (jsonStr) {
+          try {
+            const data = JSON.parse(jsonStr)
+            onEvent(data as StreamingEvent)
+          } catch (e) {
+            console.warn('Failed to parse SSE data:', jsonStr, e)
+          }
+        }
+      }
+    }
+
     while (true) {
       const { done, value } = await reader.read()
-      if (done) break
+
+      if (done) {
+        // Process any remaining data in buffer when stream ends
+        if (buffer.trim()) {
+          const remainingLines = buffer.split('\n')
+          for (const line of remainingLines) {
+            processLine(line)
+          }
+        }
+        break
+      }
 
       buffer += decoder.decode(value, { stream: true })
       const lines = buffer.split('\n')
       buffer = lines.pop() || ''
 
       for (const line of lines) {
-        if (line.startsWith('data: ')) {
-          try {
-            const data = JSON.parse(line.slice(6))
-            onEvent(data as StreamingEvent)
-          } catch {
-            // Ignore parsing errors for incomplete JSON
-          }
-        }
+        processLine(line)
       }
     }
   } catch (error) {
     if (onError) {
-      onError(error as Error)
+      onError(error instanceof Error ? error : new Error(String(error)))
     } else {
       throw error
     }

@@ -1,4 +1,5 @@
 import json
+import aiohttp
 from anthropic import AsyncAnthropic
 from app.core import get_settings, AIServiceError
 
@@ -61,6 +62,8 @@ class AIService:
             base_url=settings.anthropic_base_url if settings.anthropic_base_url else None
         )
         self.model = "claude-sonnet-4-5-20250929"
+        self.gemini_api_key = settings.gemini_api_key
+        self.gemini_model = "gemini-2.0-flash"
 
     def _extract_text(self, response) -> str:
         """Extract text from response, handling thinking blocks"""
@@ -68,6 +71,173 @@ class AIService:
             if hasattr(block, 'text'):
                 return block.text
         return ""
+
+    async def parse_resume_with_gemini(self, text: str) -> dict:
+        """使用 Gemini Flash 解析简历（更快更便宜）"""
+        if not self.gemini_api_key:
+            # 如果没有配置 Gemini，回退到 Claude
+            return await self.parse_resume(text)
+
+        prompt = """从以下简历文本中提取结构化信息，返回JSON格式：
+{
+    "name": "姓名",
+    "phone": "手机号",
+    "email": "邮箱",
+    "city": "所在城市",
+    "current_company": "当前公司",
+    "current_title": "当前职位",
+    "years_of_experience": 工作年限(数字),
+    "expected_salary": 期望薪资(万/年，数字),
+    "skills": ["技能1", "技能2"],
+    "summary": "个人简介/亮点总结"
+}
+
+只返回JSON，不要其他内容。如果某字段无法提取，设为null。
+
+简历内容：
+""" + text[:8000]
+
+        try:
+            url = f"https://generativelanguage.googleapis.com/v1beta/models/{self.gemini_model}:generateContent?key={self.gemini_api_key}"
+
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    json={
+                        "contents": [{"parts": [{"text": prompt}]}],
+                        "generationConfig": {
+                            "temperature": 0.1,
+                            "maxOutputTokens": 1024
+                        }
+                    },
+                    timeout=aiohttp.ClientTimeout(total=30)
+                ) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        print(f"Gemini API error: {response.status} - {error_text}")
+                        # 回退到 Claude
+                        return await self.parse_resume(text)
+
+                    result = await response.json()
+                    content = result.get("candidates", [{}])[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+
+                    # 提取 JSON
+                    start = content.find("{")
+                    end = content.rfind("}") + 1
+                    if start >= 0 and end > start:
+                        return json.loads(content[start:end])
+                    return {}
+
+        except Exception as e:
+            print(f"Gemini parsing failed: {e}, falling back to Claude")
+            return await self.parse_resume(text)
+
+    async def parse_resume_structured(self, text: str) -> dict:
+        """
+        解析简历为高度结构化的 Profile 格式
+        包含：基本信息、工作经历、教育背景、项目经历、技能、证书等
+        使用 Claude API（更稳定可靠）
+        """
+        prompt = """请从以下简历文本中提取完整的结构化信息。返回严格的 JSON 格式：
+
+{
+  "basic_info": {
+    "name": "姓名",
+    "gender": "性别(男/女/未知)",
+    "birth_year": 出生年份(数字或null),
+    "phone": "手机号",
+    "email": "邮箱",
+    "city": "所在城市",
+    "current_status": "当前状态(在职-考虑机会/在职-不看机会/离职-随时到岗/其他)"
+  },
+  "career_summary": {
+    "current_company": "当前/最近公司",
+    "current_title": "当前/最近职位",
+    "years_of_experience": 工作年限(数字),
+    "expected_salary": 期望薪资(万/年，数字或null),
+    "expected_salary_range": "薪资范围文本描述",
+    "one_liner": "一句话职业定位总结"
+  },
+  "work_experience": [
+    {
+      "company": "公司名称",
+      "title": "职位名称",
+      "department": "部门(如有)",
+      "start_date": "开始时间(YYYY-MM或YYYY)",
+      "end_date": "结束时间(YYYY-MM或至今)",
+      "is_current": true或false,
+      "location": "工作地点",
+      "responsibilities": ["主要职责1", "主要职责2"],
+      "achievements": ["关键成就1", "关键成就2"],
+      "tech_stack": ["使用的技术/工具"]
+    }
+  ],
+  "education": [
+    {
+      "school": "学校名称",
+      "degree": "学位(本科/硕士/博士/专科等)",
+      "major": "专业",
+      "start_date": "开始时间",
+      "end_date": "结束时间",
+      "gpa": "GPA(如有)",
+      "honors": ["荣誉/奖项"]
+    }
+  ],
+  "projects": [
+    {
+      "name": "项目名称",
+      "role": "担任角色",
+      "period": "时间段",
+      "description": "项目描述",
+      "highlights": ["项目亮点"],
+      "tech_stack": ["技术栈"]
+    }
+  ],
+  "skills": {
+    "technical": ["技术技能列表"],
+    "languages": [{"language": "语言", "level": "熟练程度"}],
+    "tools": ["工具/软件"],
+    "soft_skills": ["软技能"],
+    "industries": ["行业经验"]
+  },
+  "certifications": [
+    {
+      "name": "证书名称",
+      "issuer": "颁发机构",
+      "date": "获得时间"
+    }
+  ],
+  "highlights": ["职业亮点/核心优势，3-5条"],
+  "tags": ["适合搜索的标签词，如：产品经理、B端、SaaS、电商等"]
+}
+
+注意：
+1. 只返回 JSON，不要其他内容
+2. 如果某字段无法提取，设为 null 或空数组 []
+3. 工作经历和教育按时间倒序排列（最近的在前）
+4. 日期格式统一为 YYYY-MM 或 YYYY
+5. 从职责描述中提炼关键成就，量化数据优先
+
+简历内容：
+""" + text[:12000]
+
+        try:
+            # 使用 Claude API（稳定可靠，避免 SSL 问题）
+            response = await self.client.messages.create(
+                model=self.model,
+                max_tokens=4096,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            content = self._extract_text(response)
+            start = content.find("{")
+            end = content.rfind("}") + 1
+            if start >= 0 and end > start:
+                return json.loads(content[start:end])
+            return {}
+
+        except Exception as e:
+            print(f"Structured resume parsing failed: {e}")
+            return {}
 
     async def intelligent_search(self, query: str, search_executor) -> dict:
         """
