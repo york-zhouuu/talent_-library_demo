@@ -400,6 +400,38 @@ export interface SearchResult {
   skills: string | null
   match_reasons: { field: string; reason: string }[]
   fit_summary?: string  // 一句话匹配总结
+  highlights?: Record<string, string[]>  // ES 高亮匹配片段
+}
+
+export interface AggregationBucket {
+  value: string
+  count: number
+}
+
+export interface SearchAggregations {
+  cities?: AggregationBucket[]
+  experience?: AggregationBucket[]
+  salary?: AggregationBucket[]
+}
+
+export interface UnifiedSearchResponse {
+  candidates: SearchResult[]
+  total: number
+  aggregations: SearchAggregations
+  search_path: 'direct' | 'full' | 'semantic' | 'service'
+  path_description: string
+  latency_ms: number
+  search_backend: string
+  search_summary?: string
+  search_history?: { terms: string[]; found: number }[]
+}
+
+export interface SearchFilters {
+  city?: string
+  min_experience?: number
+  max_experience?: number
+  min_salary?: number
+  max_salary?: number
 }
 
 export interface SearchResponse {
@@ -528,6 +560,33 @@ export const streamingSearch = async (
       throw error
     }
   }
+}
+
+// Unified Search - Smart routing between fast ES search and AI search
+export const unifiedSearch = async (
+  query: string,
+  filters?: SearchFilters,
+  limit = 20,
+  forcePath?: 'direct' | 'full'
+): Promise<UnifiedSearchResponse> => {
+  const res = await api.post<UnifiedSearchResponse>('/search/', {
+    query,
+    filters,
+    limit,
+    force_path: forcePath
+  })
+  return res.data
+}
+
+// Analyze which search path would be used
+export const analyzeSearchPath = async (query: string) => {
+  const res = await api.get<{
+    query: string
+    recommended_path: string
+    path_description: string
+    is_natural_language: boolean
+  }>('/search/path/analyze', { params: { query } })
+  return res.data
 }
 
 // Stats

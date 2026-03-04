@@ -31,6 +31,18 @@ class SearchResultItem(BaseModel):
     skills: str | None
     match_reasons: list[MatchReason]
     fit_summary: str | None = None  # 一句话总结匹配原因
+    highlights: dict | None = None  # ES 高亮匹配片段 {"skills": ["<mark>Python</mark>..."]}
+
+
+class AggregationBucket(BaseModel):
+    value: str
+    count: int
+
+
+class SearchAggregations(BaseModel):
+    cities: list[AggregationBucket] | None = None
+    experience: list[AggregationBucket] | None = None
+    salary: list[AggregationBucket] | None = None
 
 
 class SearchResponse(BaseModel):

@@ -1,13 +1,17 @@
-import { useState, useCallback, useRef } from 'react'
-import { Search as SearchIcon, Users, MapPin, Briefcase, Loader2, Sparkles, ChevronDown, ChevronUp, CheckCircle2, X, Building } from 'lucide-react'
+import { useState, useCallback, useEffect, useRef } from 'react'
+import { Search as SearchIcon, MapPin, Briefcase, Loader2, Sparkles, X, Building, Clock, Filter, Zap, Brain, ChevronDown, ChevronUp } from 'lucide-react'
 import clsx from 'clsx'
-import { intelligentSearch, streamingSearch, SearchResult, SearchStage, StreamingEvent, getErrorMessage } from '../services/api'
+import {
+  unifiedSearch,
+  SearchResult,
+  SearchAggregations,
+  SearchFilters,
+  AggregationBucket,
+  streamingSearch,
+  StreamingEvent,
+  getErrorMessage
+} from '../services/api'
 import { useToast } from '../components/Toast'
-
-interface SearchHistory {
-  terms: string[]
-  found: number
-}
 
 // 解析技能字符串的辅助函数
 function parseSkills(skills: string | null): string[] {
@@ -20,315 +24,376 @@ function parseSkills(skills: string | null): string[] {
   }
 }
 
-// Stage display config
-const stageConfig: Record<SearchStage, { label: string; icon: string }> = {
-  parsing: { label: '解析搜索意图', icon: '🔍' },
-  expanding: { label: '扩展搜索关键词', icon: '💡' },
-  searching: { label: '搜索候选人', icon: '📊' },
-  ranking: { label: 'AI 智能排序', icon: '🎯' },
-  explaining: { label: '生成匹配解释', icon: '✨' }
+// 高亮文本渲染组件
+function HighlightedText({ text, className }: { text: string; className?: string }) {
+  // 将 <mark>...</mark> 转换为高亮 span
+  const parts = text.split(/(<mark>.*?<\/mark>)/g)
+  return (
+    <span className={className}>
+      {parts.map((part, i) => {
+        if (part.startsWith('<mark>') && part.endsWith('</mark>')) {
+          const content = part.slice(6, -7)
+          return (
+            <span key={i} className="bg-yellow-200 text-yellow-900 px-0.5 rounded">
+              {content}
+            </span>
+          )
+        }
+        return part
+      })}
+    </span>
+  )
 }
 
 export default function Search() {
   const [query, setQuery] = useState('')
   const [results, setResults] = useState<SearchResult[]>([])
   const [isSearching, setIsSearching] = useState(false)
-  const [searchSummary, setSearchSummary] = useState('')
-  const [searchHistory, setSearchHistory] = useState<SearchHistory[]>([])
-  const [showHistory, setShowHistory] = useState(false)
   const [selectedCandidate, setSelectedCandidate] = useState<SearchResult | null>(null)
 
-  // Streaming states
-  const [useStreaming, setUseStreaming] = useState(true)
-  const [currentStage, setCurrentStage] = useState<SearchStage | null>(null)
-  const [stageMessage, setStageMessage] = useState('')
-  const [completedStages, setCompletedStages] = useState<SearchStage[]>([])
-  const [isRanked, setIsRanked] = useState(false)
+  // Search metadata
+  const [searchPath, setSearchPath] = useState<string>('')
+  const [pathDescription, setPathDescription] = useState('')
+  const [latencyMs, setLatencyMs] = useState(0)
+  const [totalResults, setTotalResults] = useState(0)
+  const [searchSummary, setSearchSummary] = useState('')
 
-  // 使用 ref 来追踪 currentStage 的最新值，避免闭包陷阱
-  const currentStageRef = useRef<SearchStage | null>(null)
+  // Aggregations for filters
+  const [aggregations, setAggregations] = useState<SearchAggregations>({})
+  const [filters, setFilters] = useState<SearchFilters>({})
+  const [showFilters, setShowFilters] = useState(false)
+
+  // AI search streaming states
+  const [isAISearch, setIsAISearch] = useState(false)
+  const [aiProgress, setAiProgress] = useState('')
 
   const { showToast } = useToast()
+  const searchInputRef = useRef<HTMLInputElement>(null)
+  const debounceRef = useRef<NodeJS.Timeout>()
 
-  const handleStreamingSearch = useCallback(async () => {
-    if (!query.trim()) return
-    setIsSearching(true)
-    setResults([])
-    setSearchSummary('')
-    setSearchHistory([])
-    setCurrentStage(null)
-    setStageMessage('')
-    setCompletedStages([])
-    setIsRanked(false)
-    setSelectedCandidate(null)
-    currentStageRef.current = null
-
-    try {
-      await streamingSearch(
-        query,
-        20,
-        (event: StreamingEvent) => {
-          switch (event.type) {
-            case 'status':
-              // 使用 ref 获取最新的 stage 值
-              if (currentStageRef.current && currentStageRef.current !== event.stage) {
-                setCompletedStages(prev =>
-                  prev.includes(currentStageRef.current!) ? prev : [...prev, currentStageRef.current!]
-                )
-              }
-              currentStageRef.current = event.stage
-              setCurrentStage(event.stage)
-              setStageMessage(event.message)
-              break
-            case 'partial_result':
-              setResults(event.candidates)
-              setIsRanked(event.is_ranked)
-              break
-            case 'final_result':
-              setResults(event.candidates)
-              setSearchHistory(event.search_process || [])
-              setSearchSummary(event.reasoning || '')
-              setIsRanked(true)
-              setCurrentStage(null)
-              currentStageRef.current = null
-              setCompletedStages(['parsing', 'expanding', 'searching', 'ranking', 'explaining'])
-              break
-          }
-        },
-        (error) => {
-          console.error('Streaming search failed:', error)
-          showToast({
-            type: 'warning',
-            title: '流式搜索失败',
-            message: '正在使用普通搜索重试...'
-          })
-          // Fallback to regular search
-          handleRegularSearch()
-        }
-      )
-    } catch (e) {
-      console.error('Search error:', e)
-      showToast({
-        type: 'warning',
-        title: '流式搜索失败',
-        message: '正在使用普通搜索重试...'
-      })
-      // Fallback to regular search
-      await handleRegularSearch()
-    } finally {
-      setIsSearching(false)
+  // 执行搜索
+  const executeSearch = useCallback(async (searchQuery: string, searchFilters?: SearchFilters) => {
+    if (!searchQuery.trim()) {
+      setResults([])
+      setAggregations({})
+      return
     }
-  }, [query, showToast])
 
-  const handleRegularSearch = async () => {
-    if (!query.trim()) return
     setIsSearching(true)
-    setResults([])
-    setSearchSummary('')
-    setSearchHistory([])
+    setIsAISearch(false)
+    setAiProgress('')
     setSelectedCandidate(null)
 
     try {
-      const data = await intelligentSearch(query, 20)
-      setResults(data.candidates || [])
-      setSearchSummary(data.search_summary || '')
-      setSearchHistory(data.search_history || [])
-      setIsRanked(true)
+      const response = await unifiedSearch(searchQuery, searchFilters, 30)
+
+      setResults(response.candidates)
+      setTotalResults(response.total)
+      setAggregations(response.aggregations)
+      setSearchPath(response.search_path)
+      setPathDescription(response.path_description)
+      setLatencyMs(response.latency_ms)
+      setSearchSummary(response.search_summary || '')
+
+      // 如果是 AI 搜索路径，显示更多信息
+      if (response.search_path === 'full') {
+        setIsAISearch(true)
+      }
     } catch (e) {
       console.error('Search failed:', e)
-      const errorMsg = getErrorMessage(e)
       showToast({
         type: 'error',
         title: '搜索失败',
-        message: errorMsg
+        message: getErrorMessage(e)
       })
     } finally {
       setIsSearching(false)
     }
+  }, [showToast])
+
+  // 输入防抖搜索
+  const handleInputChange = (value: string) => {
+    setQuery(value)
+
+    // 清除之前的定时器
+    if (debounceRef.current) {
+      clearTimeout(debounceRef.current)
+    }
+
+    // 设置新的防抖定时器
+    debounceRef.current = setTimeout(() => {
+      executeSearch(value, filters)
+    }, 300)
   }
 
-  const handleSearch = useCallback(() => {
-    if (useStreaming) {
-      handleStreamingSearch()
-    } else {
-      handleRegularSearch()
+  // 回车搜索
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      if (debounceRef.current) {
+        clearTimeout(debounceRef.current)
+      }
+      executeSearch(query, filters)
     }
-  }, [useStreaming, handleStreamingSearch])
+  }
+
+  // 应用筛选
+  const applyFilter = (key: keyof SearchFilters, value: string | number | undefined) => {
+    const newFilters = { ...filters }
+    if (value === undefined || value === '') {
+      delete newFilters[key]
+    } else {
+      (newFilters as Record<string, unknown>)[key] = value
+    }
+    setFilters(newFilters)
+    executeSearch(query, newFilters)
+  }
+
+  // 清除所有筛选
+  const clearFilters = () => {
+    setFilters({})
+    executeSearch(query, {})
+  }
+
+  // 热门搜索建议
+  const suggestions = ['Python', '产品经理', '大模型', 'AI工程师', '北京', '杭州']
 
   return (
-    <div className="space-y-6">
-      <div>
-        <div className="flex items-center gap-2">
-          <Sparkles className="w-6 h-6 text-purple-600" />
-          <h1 className="text-2xl font-bold text-gray-900">AI 智能搜索</h1>
-        </div>
-        <p className="text-gray-500 mt-1">
-          AI 会自动理解你的意图，推理相关概念，多角度搜索以找到最匹配的候选人
-        </p>
-      </div>
-
-      {/* Search Box */}
-      <div className="bg-white rounded-xl border border-gray-200 p-6">
-        <div className="flex gap-3">
-          <div className="flex-1 relative">
-            <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
-            <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              onKeyDown={(e) => e.key === 'Enter' && handleSearch()}
-              placeholder="用自然语言描述你要找的人，如：有大模型经验的产品经理"
-              className="w-full pl-12 pr-4 py-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-purple-500 focus:border-purple-500"
-            />
+    <div className="h-full flex flex-col">
+      {/* Header */}
+      <div className="flex-shrink-0 bg-white border-b border-gray-200 px-6 py-4">
+        <div className="flex items-center gap-3 mb-4">
+          <div className="p-2 bg-gradient-to-br from-purple-500 to-blue-500 rounded-lg">
+            <SearchIcon className="w-5 h-5 text-white" />
           </div>
-          <button
-            onClick={handleSearch}
-            disabled={isSearching || !query.trim()}
-            className="flex items-center gap-2 px-6 py-3 bg-purple-600 text-white rounded-lg hover:bg-purple-700 disabled:opacity-50 transition-colors"
-          >
-            {isSearching ? (
-              <Loader2 className="w-5 h-5 animate-spin" />
-            ) : (
-              <Sparkles className="w-5 h-5" />
-            )}
-            智能搜索
-          </button>
+          <div>
+            <h1 className="text-xl font-bold text-gray-900">智能搜索</h1>
+            <p className="text-sm text-gray-500">输入关键词快速搜索，或用自然语言描述需求</p>
+          </div>
         </div>
 
-        {/* Streaming Toggle */}
-        <div className="mt-3 flex items-center gap-2">
-          <label className="flex items-center gap-2 text-sm text-gray-600 cursor-pointer">
-            <input
-              type="checkbox"
-              checked={useStreaming}
-              onChange={(e) => setUseStreaming(e.target.checked)}
-              className="rounded text-purple-600 focus:ring-purple-500"
-            />
-            流式搜索（实时显示搜索进度）
-          </label>
-        </div>
-
-        {/* Streaming Progress */}
-        {isSearching && useStreaming && (
-          <div className="mt-4 p-4 bg-purple-50 rounded-lg">
-            <div className="space-y-2">
-              {(['parsing', 'expanding', 'searching', 'ranking', 'explaining'] as SearchStage[]).map((stage) => {
-                const isCompleted = completedStages.includes(stage)
-                const isCurrent = currentStage === stage
-                const config = stageConfig[stage]
-
-                return (
-                  <div
-                    key={stage}
-                    className={clsx(
-                      'flex items-center gap-2 text-sm transition-all',
-                      isCompleted ? 'text-green-600' : isCurrent ? 'text-purple-700' : 'text-gray-400'
-                    )}
-                  >
-                    {isCompleted ? (
-                      <CheckCircle2 className="w-4 h-4" />
-                    ) : isCurrent ? (
-                      <Loader2 className="w-4 h-4 animate-spin" />
-                    ) : (
-                      <span className="w-4 h-4 flex items-center justify-center text-xs">{config.icon}</span>
-                    )}
-                    <span>{config.label}</span>
-                    {isCurrent && stageMessage && (
-                      <span className="text-xs text-gray-500 ml-2">- {stageMessage}</span>
-                    )}
-                  </div>
-                )
-              })}
-            </div>
-          </div>
-        )}
-
-        {/* Legacy Search Progress */}
-        {isSearching && !useStreaming && (
-          <div className="mt-4 p-4 bg-purple-50 rounded-lg">
-            <div className="flex items-center gap-2 text-purple-700">
-              <Loader2 className="w-4 h-4 animate-spin" />
-              <span className="text-sm">AI 正在分析你的需求，推理相关概念，执行多轮搜索...</span>
-            </div>
-          </div>
-        )}
-
-        {/* Search History (AI's thought process) */}
-        {searchHistory.length > 0 && (
-          <div className="mt-4">
+        {/* Search Input */}
+        <div className="relative">
+          <SearchIcon className="absolute left-4 top-1/2 -translate-y-1/2 w-5 h-5 text-gray-400" />
+          <input
+            ref={searchInputRef}
+            type="text"
+            value={query}
+            onChange={(e) => handleInputChange(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="搜索候选人... 如 'Python 北京' 或 '找能带团队的技术专家'"
+            className="w-full pl-12 pr-12 py-3 text-lg border border-gray-300 rounded-xl focus:ring-2 focus:ring-purple-500 focus:border-purple-500 transition-shadow"
+          />
+          {isSearching && (
+            <Loader2 className="absolute right-4 top-1/2 -translate-y-1/2 w-5 h-5 text-purple-500 animate-spin" />
+          )}
+          {!isSearching && query && (
             <button
-              onClick={() => setShowHistory(!showHistory)}
-              className="flex items-center gap-2 text-sm text-gray-600 hover:text-gray-900"
+              onClick={() => { setQuery(''); setResults([]); setAggregations({}); }}
+              className="absolute right-4 top-1/2 -translate-y-1/2 p-1 text-gray-400 hover:text-gray-600"
             >
-              {showHistory ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
-              AI 搜索过程 ({searchHistory.length} 轮)
+              <X className="w-4 h-4" />
             </button>
-            {showHistory && (
-              <div className="mt-2 p-3 bg-gray-50 rounded-lg space-y-2">
-                {searchHistory.map((h, i) => (
-                  <div key={i} className="flex items-center gap-2 text-sm">
-                    <span className="text-gray-400">第{i + 1}轮:</span>
-                    <span className="text-gray-700">搜索 [{h.terms.join(', ')}]</span>
-                    <span className="text-gray-500">- 找到 {h.found} 人</span>
-                  </div>
-                ))}
-              </div>
-            )}
+          )}
+        </div>
+
+        {/* Search Suggestions */}
+        {!query && (
+          <div className="mt-3 flex items-center gap-2 flex-wrap">
+            <span className="text-sm text-gray-500">热门:</span>
+            {suggestions.map((s) => (
+              <button
+                key={s}
+                onClick={() => { setQuery(s); executeSearch(s, filters); }}
+                className="px-3 py-1 text-sm bg-gray-100 text-gray-700 rounded-full hover:bg-gray-200 transition-colors"
+              >
+                {s}
+              </button>
+            ))}
           </div>
         )}
 
-        {/* AI Summary */}
-        {searchSummary && (
-          <div className="mt-4 p-4 bg-blue-50 rounded-lg">
-            <div className="text-sm text-blue-800 whitespace-pre-wrap">{searchSummary}</div>
+        {/* Search Meta Info */}
+        {searchPath && (
+          <div className="mt-3 flex items-center gap-4 text-sm">
+            <div className="flex items-center gap-1.5">
+              {searchPath === 'direct' ? (
+                <Zap className="w-4 h-4 text-yellow-500" />
+              ) : (
+                <Brain className="w-4 h-4 text-purple-500" />
+              )}
+              <span className={clsx(
+                "font-medium",
+                searchPath === 'direct' ? 'text-yellow-600' : 'text-purple-600'
+              )}>
+                {pathDescription}
+              </span>
+            </div>
+            <span className="text-gray-400">|</span>
+            <span className="text-gray-500">
+              找到 <span className="font-medium text-gray-900">{totalResults}</span> 人
+            </span>
+            <span className="text-gray-400">|</span>
+            <span className="text-gray-500">
+              耗时 <span className="font-medium text-gray-900">{latencyMs}ms</span>
+            </span>
           </div>
         )}
       </div>
 
-      {/* Results */}
-      {results.length > 0 && (
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
-          {/* Results List */}
-          <div className="lg:col-span-2 bg-white rounded-xl border border-gray-200">
-            <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-              <h2 className="font-semibold text-gray-900">搜索结果</h2>
-              <div className="flex items-center gap-3">
-                {!isRanked && (
-                  <span className="text-xs text-yellow-600 bg-yellow-50 px-2 py-1 rounded">
-                    排序中...
-                  </span>
+      {/* Main Content */}
+      <div className="flex-1 flex overflow-hidden">
+        {/* Filter Sidebar */}
+        {Object.keys(aggregations).length > 0 && (
+          <div className="w-64 flex-shrink-0 bg-gray-50 border-r border-gray-200 overflow-y-auto">
+            <div className="p-4">
+              <div className="flex items-center justify-between mb-4">
+                <h3 className="font-semibold text-gray-900 flex items-center gap-2">
+                  <Filter className="w-4 h-4" />
+                  筛选条件
+                </h3>
+                {Object.keys(filters).length > 0 && (
+                  <button
+                    onClick={clearFilters}
+                    className="text-xs text-purple-600 hover:text-purple-700"
+                  >
+                    清除
+                  </button>
                 )}
-                <span className="text-sm text-gray-500">{results.length} 人</span>
+              </div>
+
+              {/* City Filter */}
+              {aggregations.cities && aggregations.cities.length > 0 && (
+                <div className="mb-6">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-1">
+                    <MapPin className="w-3.5 h-3.5" />
+                    城市
+                  </h4>
+                  <div className="space-y-1">
+                    {aggregations.cities.map((bucket) => (
+                      <label
+                        key={bucket.value}
+                        className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-100 px-2 py-1.5 rounded"
+                      >
+                        <input
+                          type="radio"
+                          name="city"
+                          checked={filters.city === bucket.value}
+                          onChange={() => applyFilter('city', filters.city === bucket.value ? undefined : bucket.value)}
+                          className="text-purple-600 focus:ring-purple-500"
+                        />
+                        <span className="flex-1 text-gray-700">{bucket.value}</span>
+                        <span className="text-gray-400 text-xs">{bucket.count}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Experience Filter */}
+              {aggregations.experience && aggregations.experience.length > 0 && (
+                <div className="mb-6">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2 flex items-center gap-1">
+                    <Briefcase className="w-3.5 h-3.5" />
+                    工作经验
+                  </h4>
+                  <div className="space-y-1">
+                    {aggregations.experience.map((bucket) => (
+                      <label
+                        key={bucket.value}
+                        className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-100 px-2 py-1.5 rounded"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={false} // TODO: implement multi-select
+                          onChange={() => {
+                            // Parse experience range and apply filter
+                            const match = bucket.value.match(/(\d+)/)
+                            if (match) {
+                              const years = parseInt(match[1])
+                              applyFilter('min_experience', years)
+                            }
+                          }}
+                          className="rounded text-purple-600 focus:ring-purple-500"
+                        />
+                        <span className="flex-1 text-gray-700">{bucket.value}</span>
+                        <span className="text-gray-400 text-xs">{bucket.count}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Salary Filter */}
+              {aggregations.salary && aggregations.salary.length > 0 && (
+                <div className="mb-6">
+                  <h4 className="text-sm font-medium text-gray-700 mb-2">💰 期望薪资</h4>
+                  <div className="space-y-1">
+                    {aggregations.salary.map((bucket) => (
+                      <label
+                        key={bucket.value}
+                        className="flex items-center gap-2 text-sm cursor-pointer hover:bg-gray-100 px-2 py-1.5 rounded"
+                      >
+                        <input
+                          type="checkbox"
+                          checked={false}
+                          onChange={() => {}}
+                          className="rounded text-purple-600 focus:ring-purple-500"
+                        />
+                        <span className="flex-1 text-gray-700">{bucket.value}</span>
+                        <span className="text-gray-400 text-xs">{bucket.count}</span>
+                      </label>
+                    ))}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+        )}
+
+        {/* Results List */}
+        <div className="flex-1 overflow-y-auto">
+          {/* AI Summary */}
+          {searchSummary && (
+            <div className="m-4 p-4 bg-purple-50 rounded-lg border border-purple-100">
+              <div className="flex items-start gap-2">
+                <Sparkles className="w-5 h-5 text-purple-500 flex-shrink-0 mt-0.5" />
+                <div className="text-sm text-purple-800 whitespace-pre-wrap">{searchSummary}</div>
               </div>
             </div>
-            <div className="divide-y divide-gray-100 max-h-[600px] overflow-y-auto">
+          )}
+
+          {/* Results */}
+          {results.length > 0 ? (
+            <div className="divide-y divide-gray-100">
               {results.map((candidate) => (
                 <div
                   key={candidate.id}
                   onClick={() => setSelectedCandidate(candidate)}
                   className={clsx(
-                    "p-4 cursor-pointer transition-all",
-                    selectedCandidate?.id === candidate.id ? "bg-blue-50" : "hover:bg-gray-50",
-                    !isRanked && "opacity-80"
+                    "px-6 py-4 cursor-pointer transition-all",
+                    selectedCandidate?.id === candidate.id
+                      ? "bg-purple-50 border-l-4 border-purple-500"
+                      : "hover:bg-gray-50 border-l-4 border-transparent"
                   )}
-                  style={{
-                    transition: isRanked ? 'all 0.3s ease-out' : 'none'
-                  }}
                 >
                   <div className="flex items-start justify-between">
-                    <div className="flex-1">
+                    <div className="flex-1 min-w-0">
                       <div className="flex items-center gap-3">
-                        <span className="font-medium text-gray-900">{candidate.name}</span>
+                        <span className="font-semibold text-gray-900">{candidate.name}</span>
                         {candidate.fit_summary && (
-                          <span className="text-sm text-gray-600 italic">
+                          <span className="text-sm text-purple-600 italic truncate">
                             {candidate.fit_summary}
                           </span>
                         )}
                       </div>
+
                       <div className="text-sm text-gray-600 mt-1">
                         {candidate.current_title}
-                        {candidate.current_company && ` @ ${candidate.current_company}`}
+                        {candidate.current_company && (
+                          <span className="text-gray-400"> @ {candidate.current_company}</span>
+                        )}
                       </div>
+
                       <div className="flex items-center gap-4 mt-2 text-xs text-gray-500">
                         {candidate.city && (
                           <span className="flex items-center gap-1">
@@ -339,17 +404,39 @@ export default function Search() {
                         {candidate.years_of_experience && (
                           <span className="flex items-center gap-1">
                             <Briefcase className="w-3 h-3" />
-                            {candidate.years_of_experience}年经验
+                            {candidate.years_of_experience}年
                           </span>
                         )}
                         {candidate.expected_salary && (
                           <span>{candidate.expected_salary}万/年</span>
                         )}
                       </div>
-                      {candidate.match_reasons.length > 0 && (
-                        <div className="mt-2 flex flex-wrap gap-2">
-                          {candidate.match_reasons.map((r, i) => (
-                            <span key={i} className="text-xs text-purple-600 bg-purple-50 px-2 py-0.5 rounded">
+
+                      {/* Highlights from ES */}
+                      {candidate.highlights && Object.keys(candidate.highlights).length > 0 && (
+                        <div className="mt-2 space-y-1">
+                          {Object.entries(candidate.highlights).slice(0, 2).map(([field, snippets]) => (
+                            <div key={field} className="text-xs">
+                              {snippets.slice(0, 1).map((snippet, i) => (
+                                <HighlightedText
+                                  key={i}
+                                  text={snippet}
+                                  className="text-gray-600 line-clamp-1"
+                                />
+                              ))}
+                            </div>
+                          ))}
+                        </div>
+                      )}
+
+                      {/* Match Reasons */}
+                      {candidate.match_reasons.length > 0 && !candidate.highlights && (
+                        <div className="mt-2 flex flex-wrap gap-1">
+                          {candidate.match_reasons.slice(0, 3).map((r, i) => (
+                            <span
+                              key={i}
+                              className="text-xs text-purple-600 bg-purple-50 px-2 py-0.5 rounded"
+                            >
                               {r.reason}
                             </span>
                           ))}
@@ -360,129 +447,157 @@ export default function Search() {
                 </div>
               ))}
             </div>
-          </div>
-
-          {/* Detail Panel */}
-          <div className="bg-white rounded-xl border border-gray-200">
-            <div className="p-4 border-b border-gray-200 flex items-center justify-between">
-              <h2 className="font-semibold text-gray-900">候选人详情</h2>
-              {selectedCandidate && (
-                <button
-                  onClick={() => setSelectedCandidate(null)}
-                  className="p-1 text-gray-400 hover:text-gray-600 rounded"
-                >
-                  <X className="w-4 h-4" />
-                </button>
-              )}
+          ) : query && !isSearching ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-500">
+              <SearchIcon className="w-12 h-12 text-gray-300 mb-4" />
+              <p>没有找到匹配的候选人</p>
+              <p className="text-sm mt-1">尝试其他关键词或放宽筛选条件</p>
             </div>
-            {selectedCandidate ? (
-              <div className="p-4 space-y-4 max-h-[550px] overflow-y-auto">
-                <div>
-                  <div className="text-xl font-bold text-gray-900">{selectedCandidate.name}</div>
-                  {selectedCandidate.current_title && (
-                    <div className="text-gray-600 mt-1">{selectedCandidate.current_title}</div>
-                  )}
-                  {selectedCandidate.current_company && (
-                    <div className="text-sm text-gray-500">{selectedCandidate.current_company}</div>
-                  )}
+          ) : !query ? (
+            <div className="flex flex-col items-center justify-center h-full text-gray-500 px-8">
+              <div className="max-w-md text-center">
+                <div className="w-16 h-16 mx-auto mb-4 bg-gradient-to-br from-purple-100 to-blue-100 rounded-2xl flex items-center justify-center">
+                  <SearchIcon className="w-8 h-8 text-purple-500" />
                 </div>
+                <h3 className="text-lg font-medium text-gray-900 mb-2">开始搜索</h3>
+                <p className="text-sm text-gray-500 mb-6">
+                  输入关键词快速搜索，或用自然语言描述你想找的人
+                </p>
+                <div className="space-y-3 text-left bg-gray-50 rounded-lg p-4">
+                  <div className="text-xs text-gray-400 uppercase tracking-wide">示例搜索</div>
+                  <div className="space-y-2 text-sm">
+                    <p className="flex items-center gap-2">
+                      <Zap className="w-4 h-4 text-yellow-500" />
+                      <span className="text-gray-600">"Python 北京" → 快速搜索</span>
+                    </p>
+                    <p className="flex items-center gap-2">
+                      <Brain className="w-4 h-4 text-purple-500" />
+                      <span className="text-gray-600">"找能带团队的大模型专家" → AI智能搜索</span>
+                    </p>
+                  </div>
+                </div>
+              </div>
+            </div>
+          ) : null}
+        </div>
 
-                {/* Fit Summary */}
-                {selectedCandidate.fit_summary && (
-                  <div className="p-3 bg-purple-50 rounded-lg">
-                    <div className="text-xs text-purple-600 mb-1">匹配评价</div>
-                    <div className="text-sm text-purple-800">{selectedCandidate.fit_summary}</div>
+        {/* Detail Panel */}
+        {selectedCandidate && (
+          <div className="w-96 flex-shrink-0 bg-white border-l border-gray-200 overflow-y-auto">
+            <div className="sticky top-0 bg-white border-b border-gray-200 px-4 py-3 flex items-center justify-between">
+              <h3 className="font-semibold text-gray-900">候选人详情</h3>
+              <button
+                onClick={() => setSelectedCandidate(null)}
+                className="p-1 text-gray-400 hover:text-gray-600 rounded"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-4 space-y-6">
+              {/* Basic Info */}
+              <div>
+                <h4 className="text-xl font-bold text-gray-900">{selectedCandidate.name}</h4>
+                {selectedCandidate.current_title && (
+                  <p className="text-gray-600 mt-1">{selectedCandidate.current_title}</p>
+                )}
+                {selectedCandidate.current_company && (
+                  <p className="text-sm text-gray-500 flex items-center gap-1 mt-1">
+                    <Building className="w-4 h-4" />
+                    {selectedCandidate.current_company}
+                  </p>
+                )}
+              </div>
+
+              {/* Quick Stats */}
+              <div className="grid grid-cols-2 gap-3">
+                {selectedCandidate.city && (
+                  <div className="bg-gray-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-500 mb-1">城市</div>
+                    <div className="font-medium text-gray-900 flex items-center gap-1">
+                      <MapPin className="w-4 h-4 text-gray-400" />
+                      {selectedCandidate.city}
+                    </div>
                   </div>
                 )}
-
-                {/* Basic Info */}
-                <div className="space-y-3">
-                  {selectedCandidate.city && (
-                    <div className="flex items-center gap-3 text-sm">
-                      <MapPin className="w-4 h-4 text-gray-400" />
-                      <span>{selectedCandidate.city}</span>
-                    </div>
-                  )}
-                  {selectedCandidate.years_of_experience && (
-                    <div className="flex items-center gap-3 text-sm">
+                {selectedCandidate.years_of_experience && (
+                  <div className="bg-gray-50 rounded-lg p-3">
+                    <div className="text-xs text-gray-500 mb-1">经验</div>
+                    <div className="font-medium text-gray-900 flex items-center gap-1">
                       <Briefcase className="w-4 h-4 text-gray-400" />
-                      <span>{selectedCandidate.years_of_experience} 年工作经验</span>
+                      {selectedCandidate.years_of_experience} 年
                     </div>
-                  )}
-                  {selectedCandidate.current_company && (
-                    <div className="flex items-center gap-3 text-sm">
-                      <Building className="w-4 h-4 text-gray-400" />
-                      <span>{selectedCandidate.current_company}</span>
-                    </div>
-                  )}
-                </div>
-
-                {/* Salary */}
+                  </div>
+                )}
                 {selectedCandidate.expected_salary && (
-                  <div className="p-3 bg-green-50 rounded-lg">
+                  <div className="bg-green-50 rounded-lg p-3 col-span-2">
                     <div className="text-xs text-green-600 mb-1">期望薪资</div>
                     <div className="text-lg font-bold text-green-700">
                       {selectedCandidate.expected_salary} 万/年
                     </div>
                   </div>
                 )}
-
-                {/* Match Reasons */}
-                {selectedCandidate.match_reasons.length > 0 && (
-                  <div>
-                    <div className="text-xs text-gray-500 mb-2">匹配原因</div>
-                    <div className="space-y-2">
-                      {selectedCandidate.match_reasons.map((r, i) => (
-                        <div key={i} className="p-2 bg-purple-50 rounded text-sm">
-                          <span className="text-purple-700">{r.reason}</span>
-                          {r.field && (
-                            <span className="text-purple-500 text-xs ml-2">({r.field})</span>
-                          )}
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {/* Skills */}
-                {selectedCandidate.skills && (
-                  <div>
-                    <div className="text-xs text-gray-500 mb-2">技能标签</div>
-                    <div className="flex flex-wrap gap-2">
-                      {parseSkills(selectedCandidate.skills).map((skill, i) => (
-                        <span key={i} className="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded">
-                          {skill}
-                        </span>
-                      ))}
-                    </div>
-                  </div>
-                )}
               </div>
-            ) : (
-              <div className="p-12 text-center text-gray-500">
-                <Users className="w-8 h-8 text-gray-300 mx-auto mb-2" />
-                <p className="text-sm">点击左侧候选人查看详情</p>
-              </div>
-            )}
-          </div>
-        </div>
-      )}
 
-      {/* Empty State */}
-      {!isSearching && results.length === 0 && (
-        <div className="bg-white rounded-xl border border-gray-200 p-12 text-center">
-          <Users className="w-16 h-16 text-gray-300 mx-auto mb-4" />
-          <p className="text-gray-500 mb-4">输入搜索条件，AI 会帮你智能匹配候选人</p>
-          <div className="text-sm text-gray-400">
-            <p className="mb-2">示例搜索：</p>
-            <div className="space-y-1">
-              <p>"有大模型经验的产品经理"</p>
-              <p>"做过 AI Agent 的工程师"</p>
-              <p>"智谱或百度背景的算法专家"</p>
+              {/* Fit Summary */}
+              {selectedCandidate.fit_summary && (
+                <div className="bg-purple-50 rounded-lg p-4">
+                  <div className="text-xs text-purple-600 mb-2 flex items-center gap-1">
+                    <Sparkles className="w-3.5 h-3.5" />
+                    AI 匹配评价
+                  </div>
+                  <p className="text-sm text-purple-800">{selectedCandidate.fit_summary}</p>
+                </div>
+              )}
+
+              {/* Match Reasons */}
+              {selectedCandidate.match_reasons.length > 0 && (
+                <div>
+                  <h5 className="text-sm font-medium text-gray-700 mb-2">匹配原因</h5>
+                  <div className="space-y-2">
+                    {selectedCandidate.match_reasons.map((r, i) => (
+                      <div
+                        key={i}
+                        className="text-sm bg-gray-50 rounded px-3 py-2 flex items-start gap-2"
+                      >
+                        <span className="text-purple-500 mt-0.5">•</span>
+                        <span className="text-gray-700">{r.reason}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Skills */}
+              {selectedCandidate.skills && (
+                <div>
+                  <h5 className="text-sm font-medium text-gray-700 mb-2">技能</h5>
+                  <div className="flex flex-wrap gap-2">
+                    {parseSkills(selectedCandidate.skills).map((skill, i) => (
+                      <span
+                        key={i}
+                        className="px-2 py-1 bg-blue-100 text-blue-700 text-xs rounded"
+                      >
+                        {skill}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
+
+              {/* Actions */}
+              <div className="pt-4 border-t border-gray-200">
+                <button
+                  onClick={() => window.open(`/pools?candidate=${selectedCandidate.id}`, '_blank')}
+                  className="w-full py-2 px-4 bg-purple-600 text-white rounded-lg hover:bg-purple-700 transition-colors text-sm font-medium"
+                >
+                  查看完整简历
+                </button>
+              </div>
             </div>
           </div>
-        </div>
-      )}
+        )}
+      </div>
     </div>
   )
 }

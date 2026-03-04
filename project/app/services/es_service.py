@@ -259,6 +259,153 @@ class ElasticsearchService:
 
         return candidates
 
+    async def search_with_aggregations(
+        self,
+        query: str,
+        filters: dict | None = None,
+        limit: int = 50
+    ) -> dict:
+        """
+        Search candidates with aggregations for faceted navigation.
+
+        Returns:
+            Dict with hits, total, aggregations (cities, experience ranges, etc.)
+        """
+        client = await self.connect()
+
+        # Build the query
+        body: dict[str, Any] = {
+            "query": {
+                "bool": {
+                    "should": [
+                        {
+                            "multi_match": {
+                                "query": query,
+                                "fields": ["name^3", "skills^2", "current_title^2", "current_company", "summary"],
+                                "type": "best_fields",
+                                "fuzziness": "AUTO"
+                            }
+                        },
+                        {
+                            "match": {
+                                "raw_text": {
+                                    "query": query,
+                                    "boost": 0.5
+                                }
+                            }
+                        }
+                    ],
+                    "minimum_should_match": 1,
+                    "filter": []
+                }
+            },
+            "size": limit,
+            "highlight": {
+                "fields": {
+                    "skills": {"number_of_fragments": 3},
+                    "summary": {"number_of_fragments": 2},
+                    "current_title": {},
+                    "current_company": {}
+                },
+                "pre_tags": ["<mark>"],
+                "post_tags": ["</mark>"]
+            },
+            "aggs": {
+                "cities": {
+                    "terms": {
+                        "field": "city",
+                        "size": 10
+                    }
+                },
+                "experience_ranges": {
+                    "range": {
+                        "field": "years_of_experience",
+                        "ranges": [
+                            {"key": "1-3年", "from": 1, "to": 3},
+                            {"key": "3-5年", "from": 3, "to": 5},
+                            {"key": "5-10年", "from": 5, "to": 10},
+                            {"key": "10年+", "from": 10}
+                        ]
+                    }
+                },
+                "salary_ranges": {
+                    "range": {
+                        "field": "expected_salary",
+                        "ranges": [
+                            {"key": "20万以下", "to": 20},
+                            {"key": "20-40万", "from": 20, "to": 40},
+                            {"key": "40-60万", "from": 40, "to": 60},
+                            {"key": "60-100万", "from": 60, "to": 100},
+                            {"key": "100万+", "from": 100}
+                        ]
+                    }
+                }
+            }
+        }
+
+        # Add filters
+        if filters:
+            filter_clauses = body["query"]["bool"]["filter"]
+
+            if filters.get("city"):
+                filter_clauses.append({"term": {"city": filters["city"]}})
+
+            if filters.get("min_experience") is not None:
+                filter_clauses.append({"range": {"years_of_experience": {"gte": filters["min_experience"]}}})
+
+            if filters.get("max_experience") is not None:
+                filter_clauses.append({"range": {"years_of_experience": {"lte": filters["max_experience"]}}})
+
+            if filters.get("min_salary") is not None:
+                filter_clauses.append({"range": {"expected_salary": {"gte": filters["min_salary"]}}})
+
+            if filters.get("max_salary") is not None:
+                filter_clauses.append({"range": {"expected_salary": {"lte": filters["max_salary"]}}})
+
+        result = await client.search(index=self.index_name, body=body)
+
+        # Format results
+        hits = []
+        for hit in result["hits"]["hits"]:
+            doc = hit["_source"]
+            doc["_score"] = hit["_score"]
+            if "highlight" in hit:
+                doc["_highlights"] = hit["highlight"]
+            hits.append(doc)
+
+        # Format aggregations
+        aggs = {}
+        if "aggregations" in result:
+            raw_aggs = result["aggregations"]
+
+            if "cities" in raw_aggs:
+                aggs["cities"] = [
+                    {"value": b["key"], "count": b["doc_count"]}
+                    for b in raw_aggs["cities"]["buckets"]
+                    if b["key"]  # Skip empty values
+                ]
+
+            if "experience_ranges" in raw_aggs:
+                aggs["experience"] = [
+                    {"value": b["key"], "count": b["doc_count"]}
+                    for b in raw_aggs["experience_ranges"]["buckets"]
+                    if b["doc_count"] > 0
+                ]
+
+            if "salary_ranges" in raw_aggs:
+                aggs["salary"] = [
+                    {"value": b["key"], "count": b["doc_count"]}
+                    for b in raw_aggs["salary_ranges"]["buckets"]
+                    if b["doc_count"] > 0
+                ]
+
+        return {
+            "hits": hits,
+            "total": result["hits"]["total"]["value"],
+            "max_score": result["hits"]["max_score"],
+            "aggregations": aggs
+        }
+
     def _prepare_document(self, candidate: dict) -> dict:
         """Prepare a candidate dict for indexing."""
         doc = {
